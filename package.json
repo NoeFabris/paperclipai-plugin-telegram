@@ -1,0 +1,29 @@
+{
+  "name": "paperclipai-plugin-telegram",
+  "version": "0.2.0",
+  "description": "Telegram bot integration for Paperclip — push notifications, inline links, optional approve/reject buttons, bot commands",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NoeFabris/paperclipai-plugin-telegram.git"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "^2026.525.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
