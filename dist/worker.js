@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -273,21 +273,21 @@ function callbackButton(label, data) {
 
 function buildApprovalKeyboard(cfg, approvalId) {
   const rows = [];
-  const link = deepLink(cfg, "approval", approvalId);
-  if (link) rows.push([viewButton("View in Paperclip ↗", link)]);
   if (cfg.paperclipApiToken && approvalId) {
     rows.push([
       callbackButton("✅ Approve", `approve:${approvalId}`),
       callbackButton("❌ Reject", `reject:${approvalId}`),
     ]);
   }
+  const link = deepLink(cfg, "approval", approvalId);
+  if (link) rows.push([viewButton("Open in Paperclip", link)]);
   return rows.length > 0 ? { inline_keyboard: rows } : null;
 }
 
 function buildIssueKeyboard(cfg, issueId) {
   const link = deepLink(cfg, "issue", issueId);
   if (!link) return null;
-  return { inline_keyboard: [[viewButton("View in Paperclip ↗", link)]] };
+  return { inline_keyboard: [[viewButton("Open in Paperclip", link)]] };
 }
 
 // ---------------------------------------------------------------------------
@@ -332,34 +332,165 @@ function fmtStatusTransition(event, cfg) {
   return `${statusEmoji(curr)} ${ident}is now ${fmtCode(curr)}`;
 }
 
-function fmtApprovalCreated(event, cfg) {
-  const p = event.payload || {};
+function formatMoneyCents(cents) {
+  if (typeof cents !== "number" || !Number.isFinite(cents)) return null;
+  return (
+    "$" +
+    (cents / 100).toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })
+  );
+}
+
+async function fetchApproval(ctx, cfg, approvalId) {
+  if (!cfg.paperclipPublicUrl || !cfg.paperclipApiToken || !approvalId)
+    return null;
+  const base = cfg.paperclipPublicUrl.replace(/\/+$/, "");
+  const url = `${base}/api/approvals/${encodeURIComponent(approvalId)}`;
+  try {
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${cfg.paperclipApiToken}` },
+    });
+    if (!res.ok) {
+      ctx.logger.warn("fetchApproval non-2xx", { status: res.status, approvalId });
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    ctx.logger.warn("fetchApproval threw", { err: String(err), approvalId });
+    return null;
+  }
+}
+
+/**
+ * Render a 1-3 line TLDR for an approval based on its type and payload.
+ * Best-effort field probing — payload shape varies by approval type.
+ */
+function renderApprovalTldr(cfg, approval) {
+  if (!approval) return null;
+  const type = approval.type || "approval";
+  const payload = approval.payload || {};
+  switch (type) {
+    case "hire_agent": {
+      const name = payload.displayName || payload.name || "(unnamed)";
+      const adapter = payload.adapterType || payload.adapter || null;
+      const role = payload.role || null;
+      const budget = formatMoneyCents(payload.budgetMonthlyCents);
+      const lines = [`Hire agent <b>${escapeHtml(name)}</b>`];
+      const meta = [];
+      if (role) meta.push(`role ${fmtCode(role)}`);
+      if (adapter) meta.push(`adapter ${fmtCode(adapter)}`);
+      if (budget) meta.push(`budget ${escapeHtml(budget)}/mo`);
+      if (meta.length > 0) lines.push(meta.join(" · "));
+      return lines.join("\n");
+    }
+    case "approve_ceo_strategy": {
+      const summary =
+        payload.summary ||
+        payload.strategy ||
+        payload.title ||
+        payload.description;
+      const preview = summary ? bodyPreview(cfg, String(summary)) : null;
+      return preview ? `<b>Strategy</b>: ${escapeHtml(preview)}` : "CEO strategy approval";
+    }
+    case "budget_override_required": {
+      const amount =
+        formatMoneyCents(payload.amountCents) ||
+        formatMoneyCents(payload.requestedAmountCents) ||
+        formatMoneyCents(payload.newLimitCents);
+      const reason = payload.reason || payload.justification || payload.note;
+      const lines = [
+        `<b>Budget override</b>${amount ? ` (${escapeHtml(amount)})` : ""}`,
+      ];
+      if (reason) {
+        const preview = bodyPreview(cfg, String(reason));
+        if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
+      }
+      return lines.join("\n");
+    }
+    case "request_board_approval": {
+      const subject =
+        payload.subject ||
+        payload.summary ||
+        payload.title ||
+        payload.description;
+      const preview = subject ? bodyPreview(cfg, String(subject)) : null;
+      return preview
+        ? `<b>Board approval</b>: ${escapeHtml(preview)}`
+        : "Board approval request";
+    }
+    default: {
+      const bits = [];
+      for (const [k, v] of Object.entries(payload).slice(0, 4)) {
+        if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+          bits.push(`${escapeHtml(k)}: ${fmtCode(String(v).slice(0, 80))}`);
+        }
+      }
+      return bits.length > 0 ? bits.join(" · ") : null;
+    }
+  }
+}
+
+async function fmtApprovalCreated(ctx, event, cfg) {
+  const approvalId = event.entityId;
+  const eventPayload = event.payload || {};
   const lines = [`🟡 <b>Approval requested</b>`];
-  if (typeof p.type === "string") lines.push(`type ${fmtCode(p.type)}`);
-  const ctxBits = [];
-  if (typeof p.linkedAgentId === "string")
-    ctxBits.push(`agent ${fmtCode(fmtIdShort(p.linkedAgentId))}`);
-  if (typeof p.managedResourceKey === "string")
-    ctxBits.push(`key ${fmtCode(p.managedResourceKey)}`);
-  if (Array.isArray(p.issueIds) && p.issueIds.length > 0)
-    ctxBits.push(`${p.issueIds.length} issue(s)`);
-  if (ctxBits.length > 0) lines.push(ctxBits.join(" · "));
+  const approval = await fetchApproval(ctx, cfg, approvalId);
+  if (approval) {
+    const tldr = renderApprovalTldr(cfg, approval);
+    if (tldr) lines.push(tldr);
+    const who = approval.requestedByAgentId
+      ? `agent ${fmtCode(fmtIdShort(approval.requestedByAgentId))}`
+      : approval.requestedByUserId
+      ? `user ${fmtCode(fmtIdShort(approval.requestedByUserId))}`
+      : null;
+    if (who) lines.push(`<i>requested by ${who}</i>`);
+  } else {
+    if (typeof eventPayload.type === "string")
+      lines.push(`type ${fmtCode(eventPayload.type)}`);
+    const ctxBits = [];
+    if (typeof eventPayload.linkedAgentId === "string")
+      ctxBits.push(`agent ${fmtCode(fmtIdShort(eventPayload.linkedAgentId))}`);
+    if (typeof eventPayload.managedResourceKey === "string")
+      ctxBits.push(`key ${fmtCode(eventPayload.managedResourceKey)}`);
+    if (Array.isArray(eventPayload.issueIds) && eventPayload.issueIds.length > 0)
+      ctxBits.push(`${eventPayload.issueIds.length} issue(s)`);
+    if (ctxBits.length > 0) lines.push(ctxBits.join(" · "));
+    if (!cfg.paperclipApiToken) {
+      lines.push(`<i>set paperclipApiToken in plugin config to enable rich TLDR + one-tap approve/reject</i>`);
+    }
+  }
   return lines.join("\n");
 }
 
-function fmtApprovalDecided(event, cfg) {
-  const p = event.payload || {};
-  const decision = typeof p.outcome === "string"
-    ? p.outcome
-    : typeof p.decision === "string"
-    ? p.decision
-    : "decided";
-  const emoji = statusEmoji(decision);
-  const lines = [`${emoji} <b>Approval ${escapeHtml(decision)}</b>`];
-  if (typeof p.type === "string") lines.push(`type ${fmtCode(p.type)}`);
-  if (typeof p.decisionNote === "string" && p.decisionNote.length > 0) {
-    const preview = bodyPreview(cfg, p.decisionNote);
-    if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
+async function fmtApprovalDecided(ctx, event, cfg) {
+  const approvalId = event.entityId;
+  const eventPayload = event.payload || {};
+  const approval = await fetchApproval(ctx, cfg, approvalId);
+  const status =
+    (approval && approval.status) ||
+    (typeof eventPayload.outcome === "string" ? eventPayload.outcome : null) ||
+    (typeof eventPayload.decision === "string" ? eventPayload.decision : null) ||
+    "decided";
+  const emoji = statusEmoji(status);
+  const lines = [`${emoji} <b>Approval ${escapeHtml(status)}</b>`];
+  if (approval) {
+    const tldr = renderApprovalTldr(cfg, approval);
+    if (tldr) lines.push(tldr);
+    if (approval.decisionNote) {
+      const preview = bodyPreview(cfg, String(approval.decisionNote));
+      if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
+    }
+    if (approval.decidedByUserId)
+      lines.push(`<i>by ${fmtCode(fmtIdShort(approval.decidedByUserId))}</i>`);
+  } else {
+    if (typeof eventPayload.type === "string")
+      lines.push(`type ${fmtCode(eventPayload.type)}`);
+    if (typeof eventPayload.decisionNote === "string") {
+      const preview = bodyPreview(cfg, eventPayload.decisionNote);
+      if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
+    }
   }
   return lines.join("\n");
 }
@@ -634,15 +765,26 @@ async function handleCallbackQuery(ctx, cfg, query) {
   });
   if (ok && query.message) {
     const original = query.message.text || query.message.caption || "";
+    const who = escapeHtml(
+      query.from?.username || query.from?.first_name || "user"
+    );
     const decoration = action === "approve"
-      ? `\n\n<b>✅ Approved</b> by ${escapeHtml(query.from?.username || query.from?.first_name || "user")}`
-      : `\n\n<b>❌ Rejected</b> by ${escapeHtml(query.from?.username || query.from?.first_name || "user")}`;
+      ? `\n\n<b>✅ Approved</b> by ${who}`
+      : `\n\n<b>❌ Rejected</b> by ${who}`;
+    // Replace the action buttons with just the deep-link button so the user
+    // can still open the approval in Paperclip for context, but can't
+    // double-decide.
+    const link = deepLink(cfg, "approval", approvalId);
+    const replacement = link
+      ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
+      : { inline_keyboard: [] };
     await tg.editMessageText({
       chat_id: query.message.chat.id,
       message_id: query.message.message_id,
       text: clampMessage(original + decoration),
       parse_mode: "HTML",
       disable_web_page_preview: true,
+      reply_markup: replacement,
     });
   }
 }
@@ -755,7 +897,7 @@ const plugin = definePlugin({
       safe("approval.created", async (event) => {
         const cfg = await gate(event, "approvalCreated", true);
         if (!cfg) return;
-        const html = fmtApprovalCreated(event, cfg);
+        const html = await fmtApprovalCreated(ctx, event, cfg);
         const kb = buildApprovalKeyboard(cfg, event.entityId);
         await send("approval.created", html, kb ? { reply_markup: kb } : {});
       })
@@ -766,8 +908,12 @@ const plugin = definePlugin({
       safe("approval.decided", async (event) => {
         const cfg = await gate(event, "approvalDecided", true);
         if (!cfg) return;
-        const html = fmtApprovalDecided(event, cfg);
-        const kb = buildApprovalKeyboard(cfg, event.entityId);
+        const html = await fmtApprovalDecided(ctx, event, cfg);
+        // No action buttons on already-decided approvals; just a deep link.
+        const link = deepLink(cfg, "approval", event.entityId);
+        const kb = link
+          ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
+          : null;
         await send("approval.decided", html, kb ? { reply_markup: kb } : {});
       })
     );
