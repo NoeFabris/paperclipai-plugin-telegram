@@ -138,6 +138,25 @@ context from the host).
 
 - `/new <title>` — create an issue in the default project (falls back to
   company-level if no project is configured).
+- `/comment <issue id or identifier> <text>` — add a comment to an issue.
+- `/pause <agent id or name>` — pause an agent.
+- `/resume <agent id or name>` — resume a paused agent.
+
+**Reply → comment**
+
+Replying to any issue or approval notification in Telegram posts the reply
+text as a comment on the source entity. The plugin records the
+(chatId, messageId) → entity mapping in plugin state when it sends a
+notification with an entity reference, then looks it up on inbound reply.
+
+- Works for `issue.created`, `issue.updated`, `issue.comment.created`,
+  `approval.created`, `approval.decided` notifications, plus replies to
+  the `/comment` confirmation, `/new` confirmation, and `/open` output.
+- Replies that quote a message the plugin no longer tracks (e.g. older
+  notifications from before this feature shipped) get a one-shot hint
+  pointing to `/comment <id> …`.
+- Media attachments (photos, files, voice notes) on replies are not
+  currently uploaded; only the reply text becomes the comment body.
 
 Default company resolution: `defaultCompanyId` if set, otherwise the first
 company the API returns. Default project resolution: `defaultProjectId` if

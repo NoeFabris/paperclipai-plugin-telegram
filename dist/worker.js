@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -240,7 +240,7 @@ function createTelegram(ctx, token) {
 // Send helpers
 // ---------------------------------------------------------------------------
 
-async function dispatchMessage(ctx, cfg, eventType, html, extra = {}) {
+async function dispatchMessage(ctx, cfg, eventType, html, extra = {}, entityRef = null) {
   const route = resolveRoute(cfg, eventType);
   if (!route.chatId) {
     ctx.logger.warn("no chat routing — dropping message", { eventType });
@@ -260,7 +260,58 @@ async function dispatchMessage(ctx, cfg, eventType, html, extra = {}) {
     ...extra,
   };
   if (route.topicId != null) body.message_thread_id = route.topicId;
-  await tg.sendMessage(body);
+  const r = await tg.sendMessage(body);
+  if (entityRef && r.ok) {
+    await rememberEntityRef(ctx, r, entityRef);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reply-to-message → entity tracking
+//
+// When the plugin sends a notification about an issue or approval, it
+// records (chatId, messageId) → {type, id, companyId} in plugin state.
+// When a user replies to that Telegram message, onWebhook looks the entity
+// up and posts the reply text as a comment on the source entity.
+// ---------------------------------------------------------------------------
+
+function entityRefStateKey(chatId, messageId) {
+  return `tg:msg:${chatId}:${messageId}`;
+}
+
+async function rememberEntityRef(ctx, sendResult, entityRef) {
+  const msg = sendResult?.result;
+  if (!msg || msg.message_id == null || msg.chat?.id == null) return;
+  if (!entityRef || !entityRef.type || !entityRef.id) return;
+  try {
+    await ctx.state.set(
+      {
+        scopeKind: "instance",
+        stateKey: entityRefStateKey(msg.chat.id, msg.message_id),
+      },
+      {
+        type: entityRef.type,
+        id: entityRef.id,
+        companyId: entityRef.companyId || null,
+        savedAt: new Date().toISOString(),
+      }
+    );
+  } catch (err) {
+    ctx.logger.warn("state.set failed", { err: String(err) });
+  }
+}
+
+async function lookupEntityRef(ctx, chatId, messageId) {
+  if (chatId == null || messageId == null) return null;
+  try {
+    return await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: entityRefStateKey(chatId, messageId),
+    });
+  } catch (err) {
+    ctx.logger.warn("state.get failed", { err: String(err) });
+    return null;
+  }
 }
 
 function viewButton(label, url) {
@@ -594,8 +645,11 @@ async function ensureCommandsRegistered(ctx, cfg) {
       { command: "issues", description: "Recent issues" },
       { command: "open", description: "Show one issue (/open PCL-123)" },
       { command: "new", description: "Create an issue (/new <title>)" },
+      { command: "comment", description: "Comment on an issue (/comment <id> <text>)" },
       { command: "approvals", description: "List pending approvals" },
       { command: "agents", description: "List agents and their status" },
+      { command: "pause", description: "Pause an agent (/pause <id or name>)" },
+      { command: "resume", description: "Resume an agent (/resume <id or name>)" },
     ],
   });
 }
@@ -655,7 +709,7 @@ async function fetchPendingApprovals(ctx, cfg, companyId) {
   }
 }
 
-async function sendReply(ctx, cfg, message, html, extra = {}) {
+async function sendReply(ctx, cfg, message, html, extra = {}, entityRef = null) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const body = {
     chat_id: message.chat.id,
@@ -666,7 +720,10 @@ async function sendReply(ctx, cfg, message, html, extra = {}) {
   };
   if (message.message_thread_id != null)
     body.message_thread_id = message.message_thread_id;
-  await tg.sendMessage(body);
+  const r = await tg.sendMessage(body);
+  if (entityRef && r.ok) {
+    await rememberEntityRef(ctx, r, entityRef);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,16 +736,22 @@ function helpText() {
     `<i>v${VERSION}</i>`,
     "",
     "<b>Read</b>",
-    "<code>/status</code>      — plugin + instance counts",
-    "<code>/issues</code>      — recent issues",
-    "<code>/open &lt;id&gt;</code>   — show one issue (identifier or UUID)",
-    "<code>/approvals</code>   — list pending approvals",
-    "<code>/agents</code>      — list agents and their status",
+    "<code>/status</code>          — plugin + instance counts",
+    "<code>/issues</code>          — recent issues",
+    "<code>/open &lt;id&gt;</code>       — show one issue (identifier or UUID)",
+    "<code>/approvals</code>       — list pending approvals",
+    "<code>/agents</code>          — list agents and their status",
     "",
     "<b>Write</b>",
-    "<code>/new &lt;title&gt;</code> — create an issue in the default project",
+    "<code>/new &lt;title&gt;</code>     — create an issue in the default project",
+    "<code>/comment &lt;id&gt; &lt;text&gt;</code> — add a comment to an issue",
+    "<code>/pause &lt;agent&gt;</code>   — pause an agent",
+    "<code>/resume &lt;agent&gt;</code>  — resume an agent",
     "",
-    "<code>/help</code>         — this message",
+    "<b>Reply</b>",
+    "Replying to any notification posts the reply as a comment on the source issue or approval.",
+    "",
+    "<code>/help</code>             — this message",
   ].join("\n");
 }
 
@@ -940,6 +1003,212 @@ async function handleAgentsCommand(ctx, cfg, message) {
   await sendReply(ctx, cfg, message, lines.join("\n"));
 }
 
+// ---------------------------------------------------------------------------
+// Reply → comment on the referenced entity
+// ---------------------------------------------------------------------------
+
+async function handleReplyAsComment(ctx, cfg, message) {
+  const replyToId = message.reply_to_message?.message_id;
+  const ref = await lookupEntityRef(ctx, message.chat.id, replyToId);
+  if (!ref || !ref.type || !ref.id) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "<i>Reply detected, but the original notification is no longer tracked. Use <code>/comment &lt;id&gt; …</code> to comment directly.</i>"
+    );
+    return;
+  }
+  if (!cfg.paperclipApiToken) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "<i>Set <code>paperclipApiToken</code> in plugin config to enable reply → comment.</i>"
+    );
+    return;
+  }
+  const body = (message.text || "").trim();
+  if (!body) return;
+  let pathRel = null;
+  if (ref.type === "issue") pathRel = `/issues/${encodeURIComponent(ref.id)}/comments`;
+  else if (ref.type === "approval")
+    pathRel = `/approvals/${encodeURIComponent(ref.id)}/comments`;
+  if (!pathRel) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `<i>Replies are not yet supported for entity type ${fmtCode(ref.type)}.</i>`
+    );
+    return;
+  }
+  const result = await callPaperclip(ctx, cfg, pathRel, { body });
+  if (result.ok) {
+    const idLabel = ref.type === "issue" ? "issue" : "approval";
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `💬 Comment posted on ${idLabel} ${fmtCode(fmtIdShort(ref.id))}`,
+      {},
+      ref
+    );
+  } else {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed to post comment (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent + comment commands
+// ---------------------------------------------------------------------------
+
+async function resolveAgentId(ctx, cfg, arg) {
+  const needle = String(arg || "").trim();
+  if (!needle) return null;
+  if (isUuidLike(needle)) return needle;
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) return null;
+  const agents = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
+  );
+  const lower = needle.toLowerCase();
+  // Try id prefix, then exact name/displayName, then prefix match.
+  let match = agents.find((a) => a.id && a.id.startsWith(needle));
+  if (!match)
+    match = agents.find(
+      (a) =>
+        (a.displayName && a.displayName.toLowerCase() === lower) ||
+        (a.name && a.name.toLowerCase() === lower)
+    );
+  if (!match)
+    match = agents.find(
+      (a) =>
+        (a.displayName && a.displayName.toLowerCase().startsWith(lower)) ||
+        (a.name && a.name.toLowerCase().startsWith(lower))
+    );
+  return match?.id || null;
+}
+
+async function resolveIssueId(ctx, cfg, arg) {
+  const needle = String(arg || "").trim();
+  if (!needle) return null;
+  if (isUuidLike(needle)) return needle;
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) return null;
+  const issues = asArray(
+    await pcGet(
+      ctx,
+      cfg,
+      `/companies/${encodeURIComponent(companyId)}/issues?limit=200`
+    )
+  );
+  const lower = needle.toLowerCase();
+  return (
+    issues.find(
+      (i) =>
+        typeof i.identifier === "string" &&
+        i.identifier.toLowerCase() === lower
+    )?.id || null
+  );
+}
+
+async function handleCommentCommand(ctx, cfg, message, args) {
+  const parts = String(args || "").trim().split(/\s+/);
+  const ref = parts.shift();
+  const body = parts.join(" ").trim();
+  if (!ref || !body) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "Usage: <code>/comment &lt;issue id or identifier&gt; &lt;text&gt;</code>"
+    );
+    return;
+  }
+  const issueId = await resolveIssueId(ctx, cfg, ref);
+  if (!issueId) {
+    await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(ref)}`);
+    return;
+  }
+  const result = await callPaperclip(
+    ctx,
+    cfg,
+    `/issues/${encodeURIComponent(issueId)}/comments`,
+    { body }
+  );
+  if (result.ok) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `💬 Comment posted on ${fmtCode(ref)}`,
+      {},
+      { type: "issue", id: issueId }
+    );
+  } else {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+  }
+}
+
+async function handleAgentLifecycle(ctx, cfg, message, args, action) {
+  const arg = String(args || "").trim();
+  if (!arg) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Usage: <code>/${action} &lt;agent id or name&gt;</code>`
+    );
+    return;
+  }
+  const agentId = await resolveAgentId(ctx, cfg, arg);
+  if (!agentId) {
+    await sendReply(ctx, cfg, message, `Agent not found: ${fmtCode(arg)}`);
+    return;
+  }
+  const result = await callPaperclip(
+    ctx,
+    cfg,
+    `/agents/${encodeURIComponent(agentId)}/${action}`,
+    {}
+  );
+  if (result.ok) {
+    const agent = result.body || {};
+    const name = agent.displayName || agent.name || fmtIdShort(agentId);
+    const status = agent.status || "?";
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `${statusEmoji(status)} <b>${escapeHtml(name)}</b> → ${fmtCode(status)}`
+    );
+  } else {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed to ${action} (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+  }
+}
+
 async function handleCommand(ctx, cfg, message) {
   const text = String(message.text || "").trim();
   const m = text.match(/^\/([a-zA-Z]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
@@ -968,6 +1237,15 @@ async function handleCommand(ctx, cfg, message) {
       return true;
     case "agents":
       await handleAgentsCommand(ctx, cfg, message);
+      return true;
+    case "comment":
+      await handleCommentCommand(ctx, cfg, message, args);
+      return true;
+    case "pause":
+      await handleAgentLifecycle(ctx, cfg, message, args, "pause");
+      return true;
+    case "resume":
+      await handleAgentLifecycle(ctx, cfg, message, args, "resume");
       return true;
     default:
       return false;
@@ -1128,9 +1406,9 @@ const plugin = definePlugin({
       };
     }
 
-    async function send(eventType, html, opts = {}) {
+    async function send(eventType, html, opts = {}, entityRef = null) {
       const cfg = await ctx.config.get();
-      await dispatchMessage(ctx, cfg, eventType, html, opts);
+      await dispatchMessage(ctx, cfg, eventType, html, opts, entityRef);
     }
 
     async function gate(event, key, defaultOn) {
@@ -1148,7 +1426,12 @@ const plugin = definePlugin({
         if (!cfg) return;
         const html = fmtIssue("🆕 <b>Issue created</b>", event, cfg);
         const kb = buildIssueKeyboard(cfg, event.entityId);
-        await send("issue.created", html, kb ? { reply_markup: kb } : {});
+        await send(
+          "issue.created",
+          html,
+          kb ? { reply_markup: kb } : {},
+          { type: "issue", id: event.entityId, companyId: event.companyId }
+        );
       })
     );
 
@@ -1172,7 +1455,12 @@ const plugin = definePlugin({
         const head = sendDone ? `✅ <b>Issue done</b>` : `🔁 <b>Issue status changed</b>`;
         const html = [head, transition].join("\n");
         const kb = buildIssueKeyboard(cfg, event.entityId);
-        await send("issue.updated", html, kb ? { reply_markup: kb } : {});
+        await send(
+          "issue.updated",
+          html,
+          kb ? { reply_markup: kb } : {},
+          { type: "issue", id: event.entityId, companyId: event.companyId }
+        );
       })
     );
 
@@ -1192,7 +1480,10 @@ const plugin = definePlugin({
         await send(
           "issue.comment.created",
           html,
-          kb ? { reply_markup: kb } : {}
+          kb ? { reply_markup: kb } : {},
+          issueId
+            ? { type: "issue", id: issueId, companyId: event.companyId }
+            : null
         );
       })
     );
@@ -1205,7 +1496,12 @@ const plugin = definePlugin({
         if (!cfg) return;
         const html = await fmtApprovalCreated(ctx, event, cfg);
         const kb = buildApprovalKeyboard(cfg, event.entityId);
-        await send("approval.created", html, kb ? { reply_markup: kb } : {});
+        await send(
+          "approval.created",
+          html,
+          kb ? { reply_markup: kb } : {},
+          { type: "approval", id: event.entityId, companyId: event.companyId }
+        );
       })
     );
 
@@ -1220,7 +1516,12 @@ const plugin = definePlugin({
         const kb = link
           ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
           : null;
-        await send("approval.decided", html, kb ? { reply_markup: kb } : {});
+        await send(
+          "approval.decided",
+          html,
+          kb ? { reply_markup: kb } : {},
+          { type: "approval", id: event.entityId, companyId: event.companyId }
+        );
       })
     );
 
@@ -1361,6 +1662,20 @@ const plugin = definePlugin({
       const message = update.message || update.edited_message;
       if (!message) return;
       if (!inboundAllowed(cfg, message.from?.id)) return;
+
+      // Reply-to-notification → comment on the referenced entity.
+      // This branch fires regardless of enableCommands; without it the
+      // primary bidirectional UX is unreachable.
+      if (
+        message.reply_to_message &&
+        typeof message.text === "string" &&
+        message.text.trim().length > 0 &&
+        !message.text.startsWith("/")
+      ) {
+        await handleReplyAsComment(ctx, cfg, message);
+        return;
+      }
+
       if (!cfg.enableCommands) return;
       if (typeof message.text === "string" && message.text.startsWith("/")) {
         await handleCommand(ctx, cfg, message);
