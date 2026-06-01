@@ -86,6 +86,8 @@ secret store — see "Token handling" below).
 | `parseMode`            | enum    |          | `HTML` (default) or `MarkdownV2`.                                                            |
 | `bodyPreviewMaxLength` | integer |          | Truncate description / comment bodies in messages. Default 280; set to 0 to disable.         |
 | `enableCommands`       | boolean |          | Enable inbound bot commands. Default `true`.                                                 |
+| `defaultCompanyId`     | string  |          | Company UUID used by `/status` / `/issues` / `/new` / `/agents` / `/approvals`. Falls back to the first visible company. |
+| `defaultProjectId`     | string  |          | Project UUID where `/new` files issues. Falls back to the first project; company-level if none exists. |
 | `routing.<category>`   | object  |          | Per-event-class overrides — see below.                                                       |
 | `allowlist.*`          | arrays  |          | Restrict which companies/projects/agents are forwarded, and which Telegram users may issue commands or press buttons. |
 | `events.*`             | booleans|          | Per-event toggles.                                                                           |
@@ -115,12 +117,32 @@ back to `defaultChatId` / `defaultTopicId`.
 
 When `enableCommands` is on and the bot has a webhook URL (i.e.
 `paperclipPublicUrl` is configured), the plugin registers these slash
-commands:
+commands. All commands that touch instance data require
+`paperclipApiToken` to be set (they use the Paperclip REST API on your
+behalf because webhook handlers do not get a company-scoped invocation
+context from the host).
+
+**Read**
 
 - `/help` — list available commands.
-- `/status` — plugin version, bot identity, mutation-API status.
-- `/issues` — recent issues from the first company the plugin can see, with
-  status icons and deep links.
+- `/status` — plugin version, bot identity, mutation-API status, and live
+  counts (open issues, agents, pending approvals).
+- `/issues` — recent issues from the default company, with status icons
+  and deep links.
+- `/open <identifier or UUID>` — show a single issue (e.g. `/open PCL-42`)
+  with status, priority, body preview, and an "Open in Paperclip" button.
+- `/approvals` — list pending approvals with deep links.
+- `/agents` — list agents in the default company with status icons.
+
+**Write**
+
+- `/new <title>` — create an issue in the default project (falls back to
+  company-level if no project is configured).
+
+Default company resolution: `defaultCompanyId` if set, otherwise the first
+company the API returns. Default project resolution: `defaultProjectId` if
+set, otherwise the first project — and `projectId` is omitted entirely
+when no project exists, so company-level issues still work.
 
 ## Inline approve / reject (optional)
 

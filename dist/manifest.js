@@ -46,7 +46,7 @@ const eventToggle = (defaultOn, title) => ({
 export default {
   id: "paperclipai.telegram",
   apiVersion: 1,
-  version: "0.3.0",
+  version: "0.4.0",
   displayName: "Telegram",
   description:
     "Telegram bot integration for Paperclip: push notifications for issues, approvals, agent runs, comments, budgets, goals; deep links into the Paperclip UI; optional inline approve/reject buttons; bot commands over a webhook.",
@@ -55,8 +55,13 @@ export default {
   capabilities: [
     "events.subscribe",
     "http.outbound",
-    "issues.read",
     "webhooks.receive",
+    "companies.read",
+    "projects.read",
+    "issues.read",
+    "issues.create",
+    "issue.comments.create",
+    "agents.read",
   ],
   entrypoints: { worker: "./dist/worker.js" },
   webhooks: [
@@ -72,6 +77,18 @@ export default {
     additionalProperties: false,
     required: ["botToken", "defaultChatId"],
     properties: {
+      // Schema marker — never set in actual config. Its sole purpose is to
+      // anchor the host's plugin-config secret-ref extractor onto an explicit
+      // field (this one), preventing the no-schema fallback that walks the
+      // entire config for UUID-shaped strings. Our other fields hold legitimate
+      // UUIDs (e.g. defaultCompanyId) which would otherwise trip the host's
+      // secret-ref kill switch with a misleading 422.
+      _secretRefAnchor: {
+        type: "string",
+        format: "secret-ref",
+        title: "internal — leave blank",
+        description: "Internal marker. Do not set.",
+      },
       botToken: {
         type: "string",
         title: "Bot token",
@@ -103,6 +120,18 @@ export default {
         title: "Paperclip API token (optional)",
         description:
           "Board-user bearer token. When set, approval notifications include Approve / Reject inline buttons that act on your behalf via the Paperclip REST API. When blank, only deep-link buttons are shown.",
+      },
+      defaultCompanyId: {
+        type: "string",
+        title: "Default company UUID (optional)",
+        description:
+          "Company used by bot commands like /new, /issues, /agents, /approvals when none is specified. Falls back to the first company the plugin can see.",
+      },
+      defaultProjectId: {
+        type: "string",
+        title: "Default project UUID (optional)",
+        description:
+          "Project that /new issues are filed into. Falls back to the first project in the default company.",
       },
       parseMode: {
         type: "string",

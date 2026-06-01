@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -590,14 +590,87 @@ async function ensureCommandsRegistered(ctx, cfg) {
   await tg.setMyCommands({
     commands: [
       { command: "help", description: "Show available commands" },
-      { command: "status", description: "Plugin + bot status" },
-      { command: "issues", description: "List recent open issues" },
+      { command: "status", description: "Plugin + instance status & counts" },
+      { command: "issues", description: "Recent issues" },
+      { command: "open", description: "Show one issue (/open PCL-123)" },
+      { command: "new", description: "Create an issue (/new <title>)" },
+      { command: "approvals", description: "List pending approvals" },
+      { command: "agents", description: "List agents and their status" },
     ],
   });
 }
 
 // ---------------------------------------------------------------------------
-// Webhook command handlers
+// Helpers shared by command handlers
+// ---------------------------------------------------------------------------
+
+function isUuidLike(s) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    String(s || "").trim()
+  );
+}
+
+async function resolveCompanyId(ctx, cfg) {
+  if (
+    typeof cfg.defaultCompanyId === "string" &&
+    cfg.defaultCompanyId.trim().length > 0
+  )
+    return cfg.defaultCompanyId.trim();
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  return companies.length > 0 ? companies[0].id : null;
+}
+
+async function resolveProjectId(ctx, cfg, companyId) {
+  if (
+    typeof cfg.defaultProjectId === "string" &&
+    cfg.defaultProjectId.trim().length > 0
+  )
+    return cfg.defaultProjectId.trim();
+  if (!companyId) return null;
+  const projects = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/projects`)
+  );
+  return projects.length > 0 ? projects[0].id : null;
+}
+
+async function fetchPendingApprovals(ctx, cfg, companyId) {
+  if (!cfg.paperclipPublicUrl || !cfg.paperclipApiToken || !companyId)
+    return null;
+  const base = cfg.paperclipPublicUrl.replace(/\/+$/, "");
+  try {
+    const res = await fetch(
+      `${base}/api/companies/${encodeURIComponent(companyId)}/approvals`,
+      { headers: { authorization: `Bearer ${cfg.paperclipApiToken}` } }
+    );
+    if (!res.ok) {
+      ctx.logger.warn("approvals list non-2xx", { status: res.status });
+      return null;
+    }
+    const data = await res.json();
+    const arr = Array.isArray(data) ? data : data?.items || [];
+    return arr.filter((a) => a && a.status === "pending");
+  } catch (err) {
+    ctx.logger.warn("approvals list threw", { err: String(err) });
+    return null;
+  }
+}
+
+async function sendReply(ctx, cfg, message, html, extra = {}) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const body = {
+    chat_id: message.chat.id,
+    text: clampMessage(html),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...extra,
+  };
+  if (message.message_thread_id != null)
+    body.message_thread_id = message.message_thread_id;
+  await tg.sendMessage(body);
+}
+
+// ---------------------------------------------------------------------------
+// Command handlers
 // ---------------------------------------------------------------------------
 
 function helpText() {
@@ -605,10 +678,17 @@ function helpText() {
     "<b>Paperclip Telegram bot</b>",
     `<i>v${VERSION}</i>`,
     "",
-    "<b>Commands</b>",
-    "<code>/help</code>     — this message",
-    "<code>/status</code>   — plugin + bot status",
-    "<code>/issues</code>   — recent open issues",
+    "<b>Read</b>",
+    "<code>/status</code>      — plugin + instance counts",
+    "<code>/issues</code>      — recent issues",
+    "<code>/open &lt;id&gt;</code>   — show one issue (identifier or UUID)",
+    "<code>/approvals</code>   — list pending approvals",
+    "<code>/agents</code>      — list agents and their status",
+    "",
+    "<b>Write</b>",
+    "<code>/new &lt;title&gt;</code> — create an issue in the default project",
+    "",
+    "<code>/help</code>         — this message",
   ].join("\n");
 }
 
@@ -617,82 +697,277 @@ async function handleStatusCommand(ctx, cfg, message) {
     `<b>paperclipai-plugin-telegram</b> v${VERSION}`,
     `plugin id: ${fmtCode(process.env.PAPERCLIP_PLUGIN_ID || "?")}`,
     `default chat: ${fmtCode(cfg.defaultChatId || "?")}`,
-    `mutation api: ${cfg.paperclipApiToken ? "✅ configured" : "❌ disabled (set paperclipApiToken to enable)"}`,
+    `mutation api: ${cfg.paperclipApiToken ? "✅ configured" : "❌ disabled"}`,
   ];
-  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
-  await tg.sendMessage({
-    chat_id: message.chat.id,
-    message_thread_id: message.message_thread_id ?? undefined,
-    text: lines.join("\n"),
-    parse_mode: "HTML",
-  });
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (companyId) {
+    const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+    const company = companies.find((c) => c.id === companyId);
+    if (company)
+      lines.push(
+        `company: ${escapeHtml(company.name || fmtIdShort(companyId))}`
+      );
+    const issues = asArray(
+      await pcGet(
+        ctx,
+        cfg,
+        `/companies/${encodeURIComponent(companyId)}/issues?limit=100`
+      )
+    );
+    const openCount = issues.filter(
+      (i) => i.status !== "done" && i.status !== "cancelled"
+    ).length;
+    lines.push(`open issues: ${fmtCode(String(openCount))}`);
+    const agents = asArray(
+      await pcGet(
+        ctx,
+        cfg,
+        `/companies/${encodeURIComponent(companyId)}/agents`
+      )
+    );
+    lines.push(`agents: ${fmtCode(String(agents.length))}`);
+    const pending = await fetchPendingApprovals(ctx, cfg, companyId);
+    if (Array.isArray(pending))
+      lines.push(`pending approvals: ${fmtCode(String(pending.length))}`);
+  }
+  await sendReply(ctx, cfg, message, lines.join("\n"));
 }
 
 async function handleIssuesCommand(ctx, cfg, message) {
-  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
-  let listed = [];
-  try {
-    if (ctx.issues && typeof ctx.issues.list === "function") {
-      // Lists across the first company the plugin can see.
-      const companies = await ctx.companies.list({});
-      const company = (companies?.items || companies || [])[0];
-      if (company?.id) {
-        const result = await ctx.issues.list(company.id, {
-          limit: COMMAND_MAX_ISSUES,
-        });
-        listed = result?.items || result || [];
-      }
-    }
-  } catch (err) {
-    ctx.logger.warn("issues list failed", { err: String(err) });
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) {
+    await sendReply(ctx, cfg, message, "No company visible to this plugin.");
+    return;
   }
+  const listed = asArray(
+    await pcGet(
+      ctx,
+      cfg,
+      `/companies/${encodeURIComponent(companyId)}/issues?limit=${COMMAND_MAX_ISSUES}`
+    )
+  );
   const lines = [`<b>Recent issues</b>`];
-  if (listed.length === 0) {
-    lines.push("<i>(none or unable to list)</i>");
+  if (!Array.isArray(listed) || listed.length === 0) {
+    lines.push("<i>(none)</i>");
   } else {
     for (const issue of listed.slice(0, COMMAND_MAX_ISSUES)) {
       const ident = issue.identifier || fmtIdShort(issue.id || "");
       const title = issue.title || "(untitled)";
       const status = issue.status || "?";
       const link = deepLink(cfg, "issue", issue.id);
-      const lineLabel = link
+      const label = link
         ? `<a href="${escapeHtml(link)}">${escapeHtml(ident)}</a>`
         : `<b>${escapeHtml(ident)}</b>`;
       lines.push(
-        `${statusEmoji(status)} ${lineLabel} — ${escapeHtml(truncate(title, 80))}`
+        `${statusEmoji(status)} ${label} — ${escapeHtml(truncate(title, 80))}`
       );
     }
   }
-  await tg.sendMessage({
-    chat_id: message.chat.id,
-    message_thread_id: message.message_thread_id ?? undefined,
-    text: clampMessage(lines.join("\n")),
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+  await sendReply(ctx, cfg, message, lines.join("\n"));
+}
+
+async function handleOpenCommand(ctx, cfg, message, args) {
+  const arg = (args || "").trim();
+  if (!arg) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "Usage: <code>/open &lt;identifier or UUID&gt;</code>"
+    );
+    return;
+  }
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) {
+    await sendReply(ctx, cfg, message, "No company visible to this plugin.");
+    return;
+  }
+  let issue = null;
+  if (isUuidLike(arg)) {
+    issue = await pcGet(ctx, cfg, `/issues/${encodeURIComponent(arg)}`);
+  } else {
+    const issues = asArray(
+      await pcGet(
+        ctx,
+        cfg,
+        `/companies/${encodeURIComponent(companyId)}/issues?limit=200`
+      )
+    );
+    const needle = arg.toLowerCase();
+    issue =
+      issues.find(
+        (i) =>
+          typeof i.identifier === "string" &&
+          i.identifier.toLowerCase() === needle
+      ) || null;
+  }
+  if (!issue) {
+    await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(arg)}`);
+    return;
+  }
+  const ident = issue.identifier || fmtIdShort(issue.id);
+  const lines = [
+    `<b>${escapeHtml(ident)}</b> ${escapeHtml(issue.title || "(untitled)")}`,
+  ];
+  const meta = [];
+  if (issue.status)
+    meta.push(`${statusEmoji(issue.status)} ${fmtCode(issue.status)}`);
+  if (issue.priority) meta.push(`priority ${fmtCode(issue.priority)}`);
+  if (issue.assigneeAgentId)
+    meta.push(`agent ${fmtCode(fmtIdShort(issue.assigneeAgentId))}`);
+  if (meta.length > 0) lines.push(meta.join(" · "));
+  const preview = bodyPreview(cfg, issue.description);
+  if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
+  const kb = buildIssueKeyboard(cfg, issue.id);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    lines.join("\n"),
+    kb ? { reply_markup: kb } : {}
+  );
+}
+
+async function handleNewCommand(ctx, cfg, message, args) {
+  const title = (args || "").trim();
+  if (!title) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "Usage: <code>/new &lt;issue title&gt;</code>"
+    );
+    return;
+  }
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) {
+    await sendReply(ctx, cfg, message, "No company visible to this plugin.");
+    return;
+  }
+  const projectId = await resolveProjectId(ctx, cfg, companyId);
+  const result = await callPaperclip(
+    ctx,
+    cfg,
+    `/companies/${encodeURIComponent(companyId)}/issues`,
+    {
+      ...(projectId ? { projectId } : {}),
+      title: title.slice(0, 200),
+    }
+  );
+  if (!result.ok) {
+    ctx.logger.warn("issue create failed", { status: result.status });
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed to create issue (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+    return;
+  }
+  const issue = result.body || {};
+  const ident = issue.identifier || fmtIdShort(issue.id);
+  const lines = [
+    `✅ Created <b>${escapeHtml(ident)}</b>`,
+    escapeHtml(issue.title || ""),
+  ];
+  const kb = buildIssueKeyboard(cfg, issue.id);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    lines.join("\n"),
+    kb ? { reply_markup: kb } : {}
+  );
+}
+
+async function handleApprovalsCommand(ctx, cfg, message) {
+  if (!cfg.paperclipApiToken) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "<i>Set paperclipApiToken in plugin config to list approvals.</i>"
+    );
+    return;
+  }
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) return;
+  const pending = await fetchPendingApprovals(ctx, cfg, companyId);
+  if (!Array.isArray(pending)) {
+    await sendReply(ctx, cfg, message, "Could not fetch approvals.");
+    return;
+  }
+  if (pending.length === 0) {
+    await sendReply(ctx, cfg, message, "<b>Pending approvals</b>\n<i>(none)</i>");
+    return;
+  }
+  const lines = [`<b>Pending approvals (${pending.length})</b>`];
+  for (const a of pending.slice(0, 20)) {
+    const tldr = renderApprovalTldr(cfg, a);
+    const head = `🟡 ${fmtCode(fmtIdShort(a.id))}`;
+    const subject = tldr ? tldr.split("\n")[0] : `type ${fmtCode(a.type)}`;
+    const link = deepLink(cfg, "approval", a.id);
+    const headLinked = link
+      ? `🟡 <a href="${escapeHtml(link)}">${escapeHtml(fmtIdShort(a.id))}</a>`
+      : head;
+    lines.push(`${headLinked} — ${subject}`);
+  }
+  await sendReply(ctx, cfg, message, lines.join("\n"));
+}
+
+async function handleAgentsCommand(ctx, cfg, message) {
+  const companyId = await resolveCompanyId(ctx, cfg);
+  if (!companyId) return;
+  const agents = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
+  );
+  if (!Array.isArray(agents) || agents.length === 0) {
+    await sendReply(ctx, cfg, message, "<b>Agents</b>\n<i>(none)</i>");
+    return;
+  }
+  const lines = [`<b>Agents (${agents.length})</b>`];
+  for (const a of agents.slice(0, 25)) {
+    const name = a.displayName || a.name || fmtIdShort(a.id || "");
+    const status = a.status || "?";
+    const role = a.role || null;
+    const bits = [`${statusEmoji(status)} <b>${escapeHtml(name)}</b>`];
+    if (role) bits.push(fmtCode(role));
+    bits.push(fmtCode(status));
+    lines.push(bits.join(" · "));
+  }
+  await sendReply(ctx, cfg, message, lines.join("\n"));
 }
 
 async function handleCommand(ctx, cfg, message) {
   const text = String(message.text || "").trim();
-  const m = text.match(/^\/([a-zA-Z]+)(?:@\w+)?(?:\s+(.*))?$/);
+  const m = text.match(/^\/([a-zA-Z]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
   if (!m) return false;
   const cmd = m[1].toLowerCase();
-  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const args = m[2] || "";
   switch (cmd) {
     case "start":
     case "help":
-      await tg.sendMessage({
-        chat_id: message.chat.id,
-        message_thread_id: message.message_thread_id ?? undefined,
-        text: helpText(),
-        parse_mode: "HTML",
-      });
+      await sendReply(ctx, cfg, message, helpText());
       return true;
     case "status":
       await handleStatusCommand(ctx, cfg, message);
       return true;
     case "issues":
       await handleIssuesCommand(ctx, cfg, message);
+      return true;
+    case "open":
+      await handleOpenCommand(ctx, cfg, message, args);
+      return true;
+    case "new":
+      await handleNewCommand(ctx, cfg, message, args);
+      return true;
+    case "approvals":
+      await handleApprovalsCommand(ctx, cfg, message);
+      return true;
+    case "agents":
+      await handleAgentsCommand(ctx, cfg, message);
       return true;
     default:
       return false;
@@ -702,6 +977,37 @@ async function handleCommand(ctx, cfg, message) {
 // ---------------------------------------------------------------------------
 // Callback query handler (Approve / Reject)
 // ---------------------------------------------------------------------------
+
+/**
+ * GET against the Paperclip REST API.
+ *
+ * Used by bot commands (/issues, /new, /open, /agents, /approvals, /status
+ * counts) because handlers running inside onWebhook do not have an
+ * invocation scope — the host rejects company-scoped ctx.* calls with
+ * "missing, expired, or unknown invocation scope". Authenticated REST does
+ * not have that constraint.
+ */
+async function pcGet(ctx, cfg, pathRel) {
+  if (!cfg.paperclipPublicUrl || !cfg.paperclipApiToken) return null;
+  const base = cfg.paperclipPublicUrl.replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${base}/api${pathRel}`, {
+      headers: { authorization: `Bearer ${cfg.paperclipApiToken}` },
+    });
+    if (!res.ok) {
+      ctx.logger.warn("pcGet non-2xx", { status: res.status, pathRel });
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    ctx.logger.warn("pcGet threw", { err: String(err), pathRel });
+    return null;
+  }
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : value?.items || [];
+}
 
 async function callPaperclip(ctx, cfg, pathRel, body) {
   if (!cfg.paperclipPublicUrl || !cfg.paperclipApiToken)

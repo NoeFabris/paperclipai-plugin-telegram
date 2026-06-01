@@ -1,6 +1,6 @@
 {
   "name": "paperclipai-plugin-telegram",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Telegram bot integration for Paperclip — push notifications, inline links, optional approve/reject buttons, bot commands",
   "type": "module",
   "license": "MIT",
