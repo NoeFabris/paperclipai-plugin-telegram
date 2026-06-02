@@ -1,10 +1,11 @@
 # paperclipai-plugin-telegram
 
 A Telegram bot for [Paperclip](https://github.com/paperclipai/paperclip).
-Push notifications, reply to comment, tap to approve, full command
-surface.
+Get pinged when stuff happens in your Paperclip, reply to add a comment,
+tap a button to approve things, and run a bunch of slash commands
+without leaving the chat.
 
-## Install
+## Set it up
 
 ```bash
 git clone https://github.com/NoeFabris/paperclipai-plugin-telegram.git
@@ -13,119 +14,126 @@ npm install
 paperclipai plugin install "$(pwd)"
 ```
 
-Or from npm: `paperclipai plugin install paperclipai-plugin-telegram`.
-Install needs CLI board-user auth (`paperclipai auth login`) or use the
-Paperclip web UI's plugin installer.
+It's on npm too: `paperclipai plugin install paperclipai-plugin-telegram`.
 
-## Bot setup
+You'll need to be signed in to your Paperclip — either run
+`paperclipai auth login` first, or install through the Paperclip web UI.
 
-1. Talk to [@BotFather](https://t.me/BotFather), `/newbot`, save the token.
-2. Send any message to your new bot (Telegram won't deliver to users who
-   haven't initiated the chat).
-3. Get your chat id:
+### Make a bot
+
+1. Open [@BotFather](https://t.me/BotFather), say `/newbot`, give it a
+   name, save the token it spits out.
+2. Send any message to your new bot — bots can't reach you until you
+   talk to them first.
+3. Grab the chat id you want messages to land in:
    ```bash
    curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[].message.chat.id'
    ```
 
-## Configure
+### Tell the plugin about it
 
-Open the plugin's settings page in Paperclip and set at minimum:
+In the plugin's settings page in Paperclip, fill in:
 
-| Field | Required | Meaning |
+| Field | Required | What it is |
 | --- | :---: | --- |
-| `botToken` | ✓ | From @BotFather |
-| `defaultChatId` | ✓ | Where notifications land |
-| `paperclipPublicUrl` |   | Your instance origin (e.g. `https://paperclip.example.com`). Needed for deep links, the inbound webhook, bot commands, and inline action buttons |
-| `paperclipApiToken` |   | Board-user bearer token. Unlocks every write command, `/issues` action buttons, and inline Approve / Reject |
+| `botToken` | ✓ | From BotFather |
+| `defaultChatId` | ✓ | Where messages should go |
+| `paperclipPublicUrl` |   | Your Paperclip URL (e.g. `https://paperclip.example.com`). Needed for deep links, slash commands, and inline buttons |
+| `paperclipApiToken` |   | A Paperclip bearer token for *you*. Once it's set, the bot can do things on your behalf — approve, mark done, create issues, the lot |
 
-All other fields (per-event toggles, per-category chat routing,
-allowlists, default company / project, webhook secret) are documented in
-`dist/manifest.js`.
+Everything else (per-event on/off switches, per-category chat routing,
+allow-lists, default company, webhook secret) lives in
+`dist/manifest.js` if you want to dig.
 
-## Commands
+## What you can do
 
-`/help` shows this list inside Telegram.
+Type `/help` in the bot to see this list right inside Telegram.
 
-### Workspaces
+### Switching workspaces
 
-| Command | What |
+| Command | What it does |
 | --- | --- |
-| `/workspaces` (alias `/companies`) | List companies; tap a row to switch active |
-| `/use <name or id>` | Switch active workspace from the keyboard |
+| `/workspaces` (or `/companies`) | Lists your companies. Each row is a tap-to-switch button. |
+| `/use <name>` | Same thing from the keyboard, if you'd rather type |
 
-Active workspace is per Telegram user. **Notifications fire across all
-workspaces**; each notification header is tagged with its source
-workspace (e.g. `· 🏢 ReadyAF`). The operator-level `allowlist.companyIds`
-config is the only thing that suppresses an entire company.
+Each person gets their own active workspace. **Heads up:** notifications
+fire for *every* workspace regardless — your active one only changes
+which company the commands look at. Every notification header tells you
+which workspace it came from (e.g. `· 🏢 Helpy`).
 
-### Reading
+### Looking around
 
-| Command | What |
+| Command | What it does |
 | --- | --- |
-| `/status` | Plugin version, bot identity, live counts (open issues, agents, pending approvals) |
-| `/issues` | Recent issues. Each row carries action buttons — see below |
-| `/open <id or identifier>` | Show one issue with status, priority, body preview, and a deep-link button |
-| `/approvals` | Pending approvals with deep links |
-| `/agents` | Agents and their status icons |
-| `/help` | This list |
+| `/status` | Plugin version, bot info, live counts (open issues, agents, pending approvals) |
+| `/issues` | Latest issues. Each one has 👁 Open / ✅ Done / 🔁 Reopen / 💬 Comment buttons |
+| `/open <id>` | One issue in detail (works with `REA-123` or the UUID) |
+| `/approvals` | What's waiting for you to approve |
+| `/agents` | Who's idle, who's running, who's blocked |
+| `/help` | This list, in the chat |
 
-### Writing
+### Doing things
 
-| Command | What |
+| Command | What it does |
 | --- | --- |
-| `/new <title>` | Create an issue in the active workspace (default project, or company-level if no project exists) |
+| `/new <title>` | Create an issue in your active workspace |
 | `/comment <id> <text>` | Add a comment to an issue |
-| `/done <id>` | Mark issue done |
-| `/reopen <id>` | Reopen a closed issue (sets status back to `todo`) |
-| `/pause <agent id or name>` | Pause an agent |
-| `/resume <agent id or name>` | Resume a paused agent |
+| `/done <id>` | Mark an issue done |
+| `/reopen <id>` | Bring a closed issue back to `todo` |
+| `/pause <agent>` | Pause an agent |
+| `/resume <agent>` | Resume them |
 
-### Inline buttons
+### Tapping buttons
 
-| Where | Buttons |
+| Where they show up | What they do |
 | --- | --- |
 | Approval notifications | ✅ Approve · ❌ Reject (needs `paperclipApiToken`) |
 | `/issues` rows | 👁 Open · ✅ Done / 🔁 Reopen · 💬 Comment |
-| `/workspaces` rows | One per workspace, tap to switch |
-| All notifications | 👁 Open in Paperclip deep link |
+| `/workspaces` rows | One per workspace — tap to switch active |
+| Any notification | 👁 Open in Paperclip |
 
-### Reply → comment
+### Replying to notifications
 
-Replying to any issue or approval notification (or the bot's 💬 Comment
-prompt) posts the reply as a comment on the source entity. Media
-attachments are not uploaded — only the reply text becomes the comment
-body.
+Just hit reply on any issue or approval notification — whatever you
+type lands as a comment on that thing. No need to copy IDs around.
 
-## What's notified by default
+> One caveat: photos, voice notes, files won't go through (Paperclip
+> doesn't have a plugin upload endpoint yet). Only the text becomes the
+> comment.
 
-Issue done, approval requested, approval decided, agent run failed,
-budget incident opened. Every event has its own toggle under `events.*`
-in plugin config. Other available events: issue created, issue
-status-changed (any transition), issue comment created, agent run
-started / finished / cancelled, budget incident resolved, goal created /
-updated.
+## What you get pinged about (by default)
 
-Per-event-class chat routing keys: `issues`, `comments`, `approvals`,
-`agentRuns`, `errors`, `budgets`, `goals`. Each takes `{chatId,
-topicId}`; empty entries fall back to `defaultChatId` / `defaultTopicId`.
+- Issue marked done
+- Approval requested or decided
+- Agent run failed
+- Budget incident opened
 
-## Token handling
+Everything else has a toggle — issue created, status changed (any
+transition), new comments, agent runs starting / finishing / cancelled,
+budget incidents resolved, goals. Flip them on in plugin config under
+`events.*`.
 
-The bot token and the optional Paperclip API token are stored as plain
-strings in plugin config — not piped through a secret-reference system.
-Anyone with plugin-config access can read them; grant access to trusted
-operators only.
+You can also send different event classes to different chats or forum
+topics. Routing keys: `issues`, `comments`, `approvals`, `agentRuns`,
+`errors`, `budgets`, `goals` — each takes `{chatId, topicId}` and falls
+back to your defaults if you leave it blank.
 
-## Development
+## A quick note on the tokens
+
+The Telegram bot token and the Paperclip API token sit in plain text in
+your plugin config. Anyone with plugin-config access can read them, so
+keep that to people you trust.
+
+## Hacking on it
 
 ```bash
 npm install
 npm test
 ```
 
-Edit `dist/manifest.js` and `dist/worker.js` directly — no build step.
-The host watches `dist/` and restarts the worker on rebuild for
-local-path installs.
+Edit `dist/manifest.js` and `dist/worker.js` directly — there's no
+build step. The host watches `dist/` and reloads the worker when
+files change.
 
 ## License
 
