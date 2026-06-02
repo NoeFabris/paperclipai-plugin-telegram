@@ -20,13 +20,37 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
 // Captured during setup() so onWebhook / onConfigChanged can reuse the host
 // context the SDK does not pass them directly.
 let pluginCtx = null;
+
+// Process-local cache of companyId → display name. Populated lazily by
+// event handlers (which have invocation scope and can call ctx.companies.get)
+// so every notification carries the source workspace label without a REST
+// round-trip per event.
+const companyNameCache = new Map();
+
+async function getCompanyName(ctx, companyId) {
+  if (!companyId) return null;
+  if (companyNameCache.has(companyId)) return companyNameCache.get(companyId);
+  try {
+    const c = await ctx.companies.get(companyId);
+    const name = c?.name || null;
+    companyNameCache.set(companyId, name);
+    return name;
+  } catch {
+    companyNameCache.set(companyId, null);
+    return null;
+  }
+}
+
+function workspaceTag(name) {
+  return name ? ` · 🏢 ${escapeHtml(name)}` : "";
+}
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -1286,6 +1310,29 @@ async function handleAgentLifecycle(ctx, cfg, message, args, action) {
 // Multi-workspace switching
 // ---------------------------------------------------------------------------
 
+function renderWorkspacesView(companies, activeCompanyId) {
+  const lines = [`<b>Workspaces</b>`];
+  const keyboard = [];
+  for (const c of companies) {
+    const name = c.name || fmtIdShort(c.id);
+    const isActive = c.id === activeCompanyId;
+    const marker = isActive ? " 🟢 active" : "";
+    lines.push(`${escapeHtml(name)} — ${fmtCode(fmtIdShort(c.id))}${marker}`);
+    keyboard.push([
+      {
+        text: isActive ? `🟢 ${name} (active)` : `Switch to ${name}`,
+        callback_data: `ws.use:${c.id}`,
+      },
+    ]);
+  }
+  lines.push("");
+  lines.push("<i>Tap to switch. Notifications fire across all workspaces regardless of which is active.</i>");
+  return {
+    text: lines.join("\n"),
+    keyboard: { inline_keyboard: keyboard },
+  };
+}
+
 async function handleWorkspacesCommand(ctx, cfg, message) {
   const companies = asArray(await pcGet(ctx, cfg, "/companies"));
   if (companies.length === 0) {
@@ -1294,17 +1341,8 @@ async function handleWorkspacesCommand(ctx, cfg, message) {
   }
   const userId = message.from?.id || null;
   const active = await resolveCompanyId(ctx, cfg, userId);
-  const lines = [`<b>Workspaces</b>`];
-  for (const c of companies) {
-    const name = c.name || fmtIdShort(c.id);
-    const marker = c.id === active ? " 🟢 active" : "";
-    lines.push(`${escapeHtml(name)} — ${fmtCode(fmtIdShort(c.id))}${marker}`);
-  }
-  lines.push("");
-  lines.push(
-    "Switch with <code>/use &lt;name or partial id&gt;</code>"
-  );
-  await sendReply(ctx, cfg, message, lines.join("\n"));
+  const view = renderWorkspacesView(companies, active);
+  await sendReply(ctx, cfg, message, view.text, { reply_markup: view.keyboard });
 }
 
 async function handleUseCommand(ctx, cfg, message, args) {
@@ -1585,9 +1623,37 @@ async function handleIssueCallback(ctx, cfg, query, action, issueId) {
   });
 }
 
+async function handleWorkspaceSwitchCallback(ctx, cfg, query, companyId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const userId = query.from?.id || null;
+  await setUserActiveCompany(ctx, userId, companyId);
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  const matched = companies.find((c) => c.id === companyId);
+  const name = matched?.name || fmtIdShort(companyId);
+  await tg.answerCallbackQuery({
+    callback_query_id: query.id,
+    text: `🟢 Active workspace: ${name}`,
+  });
+  if (query.message) {
+    const view = renderWorkspacesView(companies, companyId);
+    await tg.editMessageText({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      text: clampMessage(view.text),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: view.keyboard,
+    });
+  }
+}
+
 async function handleCallbackQuery(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const data = String(query.data || "");
+  const wsMatch = data.match(/^ws\.use:([0-9a-f-]{36})$/i);
+  if (wsMatch) {
+    return handleWorkspaceSwitchCallback(ctx, cfg, query, wsMatch[1]);
+  }
   const issueMatch = data.match(/^issue\.(done|reopen|comment):([0-9a-f-]{36})$/i);
   if (issueMatch) {
     return handleIssueCallback(ctx, cfg, query, issueMatch[1].toLowerCase(), issueMatch[2]);
@@ -1687,7 +1753,27 @@ const plugin = definePlugin({
 
     async function send(eventType, html, opts = {}, entityRef = null) {
       const cfg = await ctx.config.get();
-      await dispatchMessage(ctx, cfg, eventType, html, opts, entityRef);
+      // Tag every outbound notification with its source workspace so users
+      // running multiple companies see at a glance which one fired it.
+      // The append is one line so it stays inline with the existing header.
+      let tagged = html;
+      const companyId = entityRef?.companyId;
+      if (companyId) {
+        const name = await getCompanyName(ctx, companyId);
+        if (name) {
+          // Insert the tag right after the first newline-bounded header line.
+          const firstBreak = html.indexOf("\n");
+          if (firstBreak === -1) {
+            tagged = html + workspaceTag(name);
+          } else {
+            tagged =
+              html.slice(0, firstBreak) +
+              workspaceTag(name) +
+              html.slice(firstBreak);
+          }
+        }
+      }
+      await dispatchMessage(ctx, cfg, eventType, tagged, opts, entityRef);
     }
 
     async function gate(event, key, defaultOn) {
@@ -1811,7 +1897,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunStarted", false);
         if (!cfg) return;
         const html = fmtAgentRun("▶️ <b>Agent run started</b>", event, cfg);
-        await send("agent.run.started", html);
+        await send("agent.run.started", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1821,7 +1907,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunFinished", false);
         if (!cfg) return;
         const html = fmtAgentRun("🏁 <b>Agent run finished</b>", event, cfg);
-        await send("agent.run.finished", html);
+        await send("agent.run.finished", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1831,7 +1917,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunCancelled", false);
         if (!cfg) return;
         const html = fmtAgentRun("🚫 <b>Agent run cancelled</b>", event, cfg);
-        await send("agent.run.cancelled", html);
+        await send("agent.run.cancelled", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1841,7 +1927,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunFailed", true);
         if (!cfg) return;
         const html = fmtAgentRun("❌ <b>Agent run failed</b>", event, cfg);
-        await send("agent.run.failed", html);
+        await send("agent.run.failed", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1852,7 +1938,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "budgetIncidentOpened", true);
         if (!cfg) return;
         const html = fmtBudget("💸 <b>Budget incident</b>", event, cfg);
-        await send("budget.incident.opened", html);
+        await send("budget.incident.opened", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1862,7 +1948,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "budgetIncidentResolved", false);
         if (!cfg) return;
         const html = fmtBudget("✅ <b>Budget incident resolved</b>", event, cfg);
-        await send("budget.incident.resolved", html);
+        await send("budget.incident.resolved", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1873,7 +1959,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "goalCreated", false);
         if (!cfg) return;
         const html = fmtGoal("🎯 <b>Goal created</b>", event, cfg);
-        await send("goal.created", html);
+        await send("goal.created", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 
@@ -1883,7 +1969,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "goalUpdated", false);
         if (!cfg) return;
         const html = fmtGoal("🎯 <b>Goal updated</b>", event, cfg);
-        await send("goal.updated", html);
+        await send("goal.updated", html, {}, { type: "event", companyId: event.companyId });
       })
     );
 

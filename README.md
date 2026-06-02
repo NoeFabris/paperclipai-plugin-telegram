@@ -129,8 +129,17 @@ Each Telegram user has their own active workspace, persisted in plugin
 state and resolved in this order: per-user active → `defaultCompanyId`
 config → first visible.
 
-- `/workspaces` (alias `/companies`) — list companies, mark the active one.
-- `/use <name or partial id>` — switch your active workspace.
+- `/workspaces` (alias `/companies`) — list companies with an inline
+  button per row. Tap a row to switch active workspace; the message
+  updates in-place to reflect the new active.
+- `/use <name or partial id>` — same effect from the keyboard.
+
+**Notifications are workspace-independent**: events from every company
+the plugin can see fire notifications regardless of which workspace any
+user has marked active. Each notification header is tagged with its
+source workspace (e.g. `✅ Issue done · 🏢 ReadyAF`). The operator-level
+`allowlist.companyIds` still applies if you want to suppress an entire
+company.
 
 **Read**
 
