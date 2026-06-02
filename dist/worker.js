@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -642,10 +642,14 @@ async function ensureCommandsRegistered(ctx, cfg) {
     commands: [
       { command: "help", description: "Show available commands" },
       { command: "status", description: "Plugin + instance status & counts" },
-      { command: "issues", description: "Recent issues" },
+      { command: "workspaces", description: "List workspaces (companies)" },
+      { command: "use", description: "Switch active workspace (/use <name>)" },
+      { command: "issues", description: "Recent issues (with action buttons)" },
       { command: "open", description: "Show one issue (/open PCL-123)" },
       { command: "new", description: "Create an issue (/new <title>)" },
       { command: "comment", description: "Comment on an issue (/comment <id> <text>)" },
+      { command: "done", description: "Mark issue done (/done <id>)" },
+      { command: "reopen", description: "Reopen an issue (/reopen <id>)" },
       { command: "approvals", description: "List pending approvals" },
       { command: "agents", description: "List agents and their status" },
       { command: "pause", description: "Pause an agent (/pause <id or name>)" },
@@ -664,7 +668,41 @@ function isUuidLike(s) {
   );
 }
 
-async function resolveCompanyId(ctx, cfg) {
+// Per-Telegram-user "active workspace" persisted in plugin state.
+// Each user can switch independently via /use <name>; commands then resolve
+// company in the order: per-user active → cfg.defaultCompanyId → first visible.
+async function getUserActiveCompany(ctx, userId) {
+  if (!userId) return null;
+  try {
+    const v = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `tg:user:${userId}:activeCompany`,
+    });
+    return v && typeof v.companyId === "string" ? v.companyId : null;
+  } catch (err) {
+    ctx.logger.warn("getUserActiveCompany failed", { err: String(err) });
+    return null;
+  }
+}
+
+async function setUserActiveCompany(ctx, userId, companyId) {
+  if (!userId || !companyId) return;
+  try {
+    await ctx.state.set(
+      {
+        scopeKind: "instance",
+        stateKey: `tg:user:${userId}:activeCompany`,
+      },
+      { companyId, savedAt: new Date().toISOString() }
+    );
+  } catch (err) {
+    ctx.logger.warn("setUserActiveCompany failed", { err: String(err) });
+  }
+}
+
+async function resolveCompanyId(ctx, cfg, userId = null) {
+  const userActive = await getUserActiveCompany(ctx, userId);
+  if (userActive) return userActive;
   if (
     typeof cfg.defaultCompanyId === "string" &&
     cfg.defaultCompanyId.trim().length > 0
@@ -735,9 +773,13 @@ function helpText() {
     "<b>Paperclip Telegram bot</b>",
     `<i>v${VERSION}</i>`,
     "",
+    "<b>Workspaces</b>",
+    "<code>/workspaces</code>      — list companies, mark the active one",
+    "<code>/use &lt;name&gt;</code>      — switch your active workspace",
+    "",
     "<b>Read</b>",
-    "<code>/status</code>          — plugin + instance counts",
-    "<code>/issues</code>          — recent issues",
+    "<code>/status</code>          — plugin + active workspace counts",
+    "<code>/issues</code>          — recent issues, each with action buttons",
     "<code>/open &lt;id&gt;</code>       — show one issue (identifier or UUID)",
     "<code>/approvals</code>       — list pending approvals",
     "<code>/agents</code>          — list agents and their status",
@@ -745,11 +787,13 @@ function helpText() {
     "<b>Write</b>",
     "<code>/new &lt;title&gt;</code>     — create an issue in the default project",
     "<code>/comment &lt;id&gt; &lt;text&gt;</code> — add a comment to an issue",
+    "<code>/done &lt;id&gt;</code>       — mark issue done",
+    "<code>/reopen &lt;id&gt;</code>     — reopen a closed issue",
     "<code>/pause &lt;agent&gt;</code>   — pause an agent",
     "<code>/resume &lt;agent&gt;</code>  — resume an agent",
     "",
-    "<b>Reply</b>",
-    "Replying to any notification posts the reply as a comment on the source issue or approval.",
+    "<b>Reply / inline buttons</b>",
+    "Replying to any notification (or the 💬 Comment prompt) posts the reply as a comment on the source entity. /issues rows include ✅ Done / 🔁 Reopen / 💬 Comment buttons that act on your behalf.",
     "",
     "<code>/help</code>             — this message",
   ].join("\n");
@@ -762,7 +806,7 @@ async function handleStatusCommand(ctx, cfg, message) {
     `default chat: ${fmtCode(cfg.defaultChatId || "?")}`,
     `mutation api: ${cfg.paperclipApiToken ? "✅ configured" : "❌ disabled"}`,
   ];
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (companyId) {
     const companies = asArray(await pcGet(ctx, cfg, "/companies"));
     const company = companies.find((c) => c.id === companyId);
@@ -797,7 +841,7 @@ async function handleStatusCommand(ctx, cfg, message) {
 }
 
 async function handleIssuesCommand(ctx, cfg, message) {
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -810,6 +854,7 @@ async function handleIssuesCommand(ctx, cfg, message) {
     )
   );
   const lines = [`<b>Recent issues</b>`];
+  const inlineKeyboard = [];
   if (!Array.isArray(listed) || listed.length === 0) {
     lines.push("<i>(none)</i>");
   } else {
@@ -824,9 +869,37 @@ async function handleIssuesCommand(ctx, cfg, message) {
       lines.push(
         `${statusEmoji(status)} ${label} — ${escapeHtml(truncate(title, 80))}`
       );
+      const row = [];
+      if (link) row.push({ text: `👁 ${ident}`, url: link });
+      if (issue.id) {
+        if (status === "done") {
+          row.push({
+            text: "🔁 Reopen",
+            callback_data: `issue.reopen:${issue.id}`,
+          });
+        } else {
+          row.push({
+            text: "✅ Done",
+            callback_data: `issue.done:${issue.id}`,
+          });
+        }
+        row.push({
+          text: "💬 Comment",
+          callback_data: `issue.comment:${issue.id}`,
+        });
+      }
+      if (row.length > 0) inlineKeyboard.push(row);
     }
   }
-  await sendReply(ctx, cfg, message, lines.join("\n"));
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    lines.join("\n"),
+    inlineKeyboard.length > 0
+      ? { reply_markup: { inline_keyboard: inlineKeyboard } }
+      : {}
+  );
 }
 
 async function handleOpenCommand(ctx, cfg, message, args) {
@@ -840,7 +913,7 @@ async function handleOpenCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -902,7 +975,7 @@ async function handleNewCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -955,7 +1028,7 @@ async function handleApprovalsCommand(ctx, cfg, message) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) return;
   const pending = await fetchPendingApprovals(ctx, cfg, companyId);
   if (!Array.isArray(pending)) {
@@ -981,7 +1054,7 @@ async function handleApprovalsCommand(ctx, cfg, message) {
 }
 
 async function handleAgentsCommand(ctx, cfg, message) {
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) return;
   const agents = asArray(
     await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
@@ -1070,11 +1143,11 @@ async function handleReplyAsComment(ctx, cfg, message) {
 // Agent + comment commands
 // ---------------------------------------------------------------------------
 
-async function resolveAgentId(ctx, cfg, arg) {
+async function resolveAgentId(ctx, cfg, arg, userId = null) {
   const needle = String(arg || "").trim();
   if (!needle) return null;
   if (isUuidLike(needle)) return needle;
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, userId);
   if (!companyId) return null;
   const agents = asArray(
     await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
@@ -1097,11 +1170,11 @@ async function resolveAgentId(ctx, cfg, arg) {
   return match?.id || null;
 }
 
-async function resolveIssueId(ctx, cfg, arg) {
+async function resolveIssueId(ctx, cfg, arg, userId = null) {
   const needle = String(arg || "").trim();
   if (!needle) return null;
   if (isUuidLike(needle)) return needle;
-  const companyId = await resolveCompanyId(ctx, cfg);
+  const companyId = await resolveCompanyId(ctx, cfg, userId);
   if (!companyId) return null;
   const issues = asArray(
     await pcGet(
@@ -1133,7 +1206,7 @@ async function handleCommentCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const issueId = await resolveIssueId(ctx, cfg, ref);
+  const issueId = await resolveIssueId(ctx, cfg, ref, message.from?.id || null);
   if (!issueId) {
     await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(ref)}`);
     return;
@@ -1176,7 +1249,7 @@ async function handleAgentLifecycle(ctx, cfg, message, args, action) {
     );
     return;
   }
-  const agentId = await resolveAgentId(ctx, cfg, arg);
+  const agentId = await resolveAgentId(ctx, cfg, arg, message.from?.id || null);
   if (!agentId) {
     await sendReply(ctx, cfg, message, `Agent not found: ${fmtCode(arg)}`);
     return;
@@ -1203,6 +1276,124 @@ async function handleAgentLifecycle(ctx, cfg, message, args, action) {
       cfg,
       message,
       `Failed to ${action} (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-workspace switching
+// ---------------------------------------------------------------------------
+
+async function handleWorkspacesCommand(ctx, cfg, message) {
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  if (companies.length === 0) {
+    await sendReply(ctx, cfg, message, "No companies visible to this plugin.");
+    return;
+  }
+  const userId = message.from?.id || null;
+  const active = await resolveCompanyId(ctx, cfg, userId);
+  const lines = [`<b>Workspaces</b>`];
+  for (const c of companies) {
+    const name = c.name || fmtIdShort(c.id);
+    const marker = c.id === active ? " 🟢 active" : "";
+    lines.push(`${escapeHtml(name)} — ${fmtCode(fmtIdShort(c.id))}${marker}`);
+  }
+  lines.push("");
+  lines.push(
+    "Switch with <code>/use &lt;name or partial id&gt;</code>"
+  );
+  await sendReply(ctx, cfg, message, lines.join("\n"));
+}
+
+async function handleUseCommand(ctx, cfg, message, args) {
+  const arg = String(args || "").trim();
+  if (!arg) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "Usage: <code>/use &lt;company name or id&gt;</code>"
+    );
+    return;
+  }
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  const lower = arg.toLowerCase();
+  let match = null;
+  if (isUuidLike(arg)) match = companies.find((c) => c.id === arg);
+  if (!match)
+    match = companies.find(
+      (c) => c.name && c.name.toLowerCase() === lower
+    );
+  if (!match)
+    match = companies.find(
+      (c) => c.name && c.name.toLowerCase().startsWith(lower)
+    );
+  if (!match)
+    match = companies.find((c) => c.id && c.id.startsWith(arg));
+  if (!match) {
+    await sendReply(ctx, cfg, message, `No workspace matches ${fmtCode(arg)}`);
+    return;
+  }
+  await setUserActiveCompany(ctx, message.from?.id || null, match.id);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    `🟢 Active workspace: <b>${escapeHtml(
+      match.name || fmtIdShort(match.id)
+    )}</b>`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Issue lifecycle commands (/done /reopen — siblings of /pause /resume)
+// ---------------------------------------------------------------------------
+
+async function handleIssueStatusChange(ctx, cfg, message, args, targetStatus) {
+  const arg = String(args || "").trim();
+  if (!arg) {
+    const verb = targetStatus === "done" ? "done" : "reopen";
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Usage: <code>/${verb} &lt;issue id or identifier&gt;</code>`
+    );
+    return;
+  }
+  const issueId = await resolveIssueId(ctx, cfg, arg, message.from?.id || null);
+  if (!issueId) {
+    await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(arg)}`);
+    return;
+  }
+  const result = await pcRequest(
+    ctx,
+    cfg,
+    "PATCH",
+    `/issues/${encodeURIComponent(issueId)}`,
+    { status: targetStatus }
+  );
+  if (result.ok) {
+    const issue = result.body || {};
+    const ident = issue.identifier || fmtIdShort(issueId);
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `${statusEmoji(issue.status || targetStatus)} <b>${escapeHtml(
+        ident
+      )}</b> → ${fmtCode(issue.status || targetStatus)}`,
+      {},
+      { type: "issue", id: issueId }
+    );
+  } else {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed (${result.status}): ${fmtCode(
         truncate(JSON.stringify(result.body || {}), 200)
       )}`
     );
@@ -1247,6 +1438,19 @@ async function handleCommand(ctx, cfg, message) {
     case "resume":
       await handleAgentLifecycle(ctx, cfg, message, args, "resume");
       return true;
+    case "done":
+      await handleIssueStatusChange(ctx, cfg, message, args, "done");
+      return true;
+    case "reopen":
+      await handleIssueStatusChange(ctx, cfg, message, args, "todo");
+      return true;
+    case "workspaces":
+    case "companies":
+      await handleWorkspacesCommand(ctx, cfg, message);
+      return true;
+    case "use":
+      await handleUseCommand(ctx, cfg, message, args);
+      return true;
     default:
       return false;
   }
@@ -1287,32 +1491,107 @@ function asArray(value) {
   return Array.isArray(value) ? value : value?.items || [];
 }
 
-async function callPaperclip(ctx, cfg, pathRel, body) {
+async function pcRequest(ctx, cfg, method, pathRel, body) {
   if (!cfg.paperclipPublicUrl || !cfg.paperclipApiToken)
-    return { ok: false, status: 0, description: "no api token configured" };
+    return { ok: false, status: 0, body: { error: "no api token configured" } };
   const base = cfg.paperclipPublicUrl.replace(/\/+$/, "");
   const url = `${base}/api${pathRel}`;
-  const res = await fetch(url, {
-    method: "POST",
+  const init = {
+    method,
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${cfg.paperclipApiToken}`,
     },
-    body: JSON.stringify(body ?? {}),
-  });
-  const text = await res.text().catch(() => "");
-  let json;
+  };
+  if (body !== undefined && body !== null && method !== "GET")
+    init.body = JSON.stringify(body);
   try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text.slice(0, 200) };
+    const res = await fetch(url, init);
+    const text = await res.text().catch(() => "");
+    let json;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text.slice(0, 200) };
+    }
+    return { ok: res.ok, status: res.status, body: json };
+  } catch (err) {
+    ctx.logger.warn("pcRequest threw", { err: String(err), method, pathRel });
+    return { ok: false, status: 0, body: { error: String(err) } };
   }
-  return { ok: res.ok, status: res.status, body: json };
+}
+
+// Backwards-compatible POST helper used by approve/reject + comment paths.
+async function callPaperclip(ctx, cfg, pathRel, body) {
+  return pcRequest(ctx, cfg, "POST", pathRel, body ?? {});
+}
+
+async function handleIssueCallback(ctx, cfg, query, action, issueId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  if (!cfg.paperclipApiToken) {
+    await tg.answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "Issue actions require paperclipApiToken to be set in plugin config.",
+      show_alert: true,
+    });
+    return;
+  }
+  if (action === "done" || action === "reopen") {
+    const newStatus = action === "done" ? "done" : "todo";
+    const result = await pcRequest(
+      ctx,
+      cfg,
+      "PATCH",
+      `/issues/${encodeURIComponent(issueId)}`,
+      { status: newStatus }
+    );
+    await tg.answerCallbackQuery({
+      callback_query_id: query.id,
+      text: result.ok
+        ? action === "done"
+          ? "Marked done ✅"
+          : "Reopened 🔁"
+        : `Failed (${result.status})`,
+      show_alert: !result.ok,
+    });
+    return;
+  }
+  if (action === "comment") {
+    // Prompt the user for the comment body via force_reply; the resulting
+    // reply will route through handleReplyAsComment because we record the
+    // entity ref on this prompt message.
+    const promptText = `💬 Reply to this message with your comment for issue ${fmtCode(
+      fmtIdShort(issueId)
+    )}`;
+    const r = await tg.sendMessage({
+      chat_id: query.message.chat.id,
+      message_thread_id: query.message.message_thread_id ?? undefined,
+      text: promptText,
+      parse_mode: "HTML",
+      reply_markup: { force_reply: true, selective: true },
+    });
+    if (r.ok) {
+      await rememberEntityRef(ctx, r, { type: "issue", id: issueId });
+    }
+    await tg.answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "Reply to the prompt to add your comment",
+    });
+    return;
+  }
+  await tg.answerCallbackQuery({
+    callback_query_id: query.id,
+    text: `Unknown issue action: ${action}`,
+  });
 }
 
 async function handleCallbackQuery(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const data = String(query.data || "");
+  const issueMatch = data.match(/^issue\.(done|reopen|comment):([0-9a-f-]{36})$/i);
+  if (issueMatch) {
+    return handleIssueCallback(ctx, cfg, query, issueMatch[1].toLowerCase(), issueMatch[2]);
+  }
   const m = data.match(/^(approve|reject):([a-f0-9-]{8,})$/i);
   if (!m) {
     await tg.answerCallbackQuery({

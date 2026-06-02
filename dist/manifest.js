@@ -46,7 +46,7 @@ const eventToggle = (defaultOn, title) => ({
 export default {
   id: "paperclipai.telegram",
   apiVersion: 1,
-  version: "0.5.0",
+  version: "0.6.0",
   displayName: "Telegram",
   description:
     "Telegram bot integration for Paperclip: push notifications for issues, approvals, agent runs, comments, budgets, goals; deep links into the Paperclip UI; optional inline approve/reject buttons; bot commands over a webhook.",
@@ -62,6 +62,7 @@ export default {
     "projects.read",
     "issues.read",
     "issues.create",
+    "issues.update",
     "issue.comments.create",
     "agents.read",
     "agents.pause",

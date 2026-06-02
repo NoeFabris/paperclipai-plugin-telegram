@@ -122,13 +122,25 @@ commands. All commands that touch instance data require
 behalf because webhook handlers do not get a company-scoped invocation
 context from the host).
 
+**Workspaces (multi-company)**
+
+The plugin can speak to every company the configured API token can see.
+Each Telegram user has their own active workspace, persisted in plugin
+state and resolved in this order: per-user active → `defaultCompanyId`
+config → first visible.
+
+- `/workspaces` (alias `/companies`) — list companies, mark the active one.
+- `/use <name or partial id>` — switch your active workspace.
+
 **Read**
 
 - `/help` — list available commands.
 - `/status` — plugin version, bot identity, mutation-API status, and live
   counts (open issues, agents, pending approvals).
-- `/issues` — recent issues from the default company, with status icons
-  and deep links.
+- `/issues` — recent issues from the active workspace. Each row carries
+  inline buttons: **👁 Open** (deep link), **✅ Done** / **🔁 Reopen**
+  (PATCH `/issues/:id`), and **💬 Comment** (sends a force-reply prompt;
+  your reply becomes the comment body).
 - `/open <identifier or UUID>` — show a single issue (e.g. `/open PCL-42`)
   with status, priority, body preview, and an "Open in Paperclip" button.
 - `/approvals` — list pending approvals with deep links.
@@ -139,6 +151,8 @@ context from the host).
 - `/new <title>` — create an issue in the default project (falls back to
   company-level if no project is configured).
 - `/comment <issue id or identifier> <text>` — add a comment to an issue.
+- `/done <id>` — mark an issue done.
+- `/reopen <id>` — reopen a closed issue (sets status back to `todo`).
 - `/pause <agent id or name>` — pause an agent.
 - `/resume <agent id or name>` — resume a paused agent.
 
