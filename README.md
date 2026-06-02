@@ -85,12 +85,27 @@ which workspace it came from (e.g. `· 🏢 Helpy`).
 
 ### Tapping buttons
 
-| Where they show up | What they do |
+Every tap updates the message it came from — no separate "approved!"
+ping, no stale buttons. Approving an approval edits the original
+message in place ("✅ Approved by …") and collapses the row to a single
+"Open in Paperclip" button. Marking an issue done or reopening it
+re-renders the issue list (or the `/open` detail) so the row reflects
+the new status. Pausing an agent re-renders the agent list.
+
+| Where they show up | Buttons |
 | --- | --- |
-| Approval notifications | ✅ Approve · ❌ Reject (needs `paperclipApiToken`) |
+| Approval notifications | ✅ Approve · ❌ Reject · 💬 Comment (needs `paperclipApiToken`) |
+| `/approvals` rows | Same three per row |
 | `/issues` rows | 👁 Open · ✅ Done / 🔁 Reopen · 💬 Comment |
+| `/open` detail | 👁 Open · ✅ Done / 🔁 Reopen · 💬 Comment |
+| `/agents` rows | ⏸ Pause / ▶️ Resume |
 | `/workspaces` rows | One per workspace — tap to switch active |
 | Any notification | 👁 Open in Paperclip |
+
+When you decide an approval from Telegram, the plugin also suppresses
+the duplicate `approval.decided` notification it would otherwise emit
+to its routed chat — you already saw the decision land in the message
+you just tapped.
 
 ### Replying to notifications
 

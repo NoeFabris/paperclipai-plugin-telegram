@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -50,6 +50,27 @@ async function getCompanyName(ctx, companyId) {
 
 function workspaceTag(name) {
   return name ? ` · 🏢 ${escapeHtml(name)}` : "";
+}
+
+// Approvals decided via Telegram inline buttons within the last
+// DECIDED_TTL_MS are suppressed on the approval.decided notification
+// path — the user already saw the decision reflected in-place on the
+// original message and doesn't need a duplicate ping.
+const DECIDED_TTL_MS = 60_000;
+const recentlyDecidedViaTelegram = new Map();
+function markRecentlyDecidedViaTelegram(approvalId) {
+  if (!approvalId) return;
+  recentlyDecidedViaTelegram.set(approvalId, Date.now() + DECIDED_TTL_MS);
+}
+function wasRecentlyDecidedViaTelegram(approvalId) {
+  if (!approvalId) return false;
+  const exp = recentlyDecidedViaTelegram.get(approvalId);
+  if (!exp) return false;
+  if (exp < Date.now()) {
+    recentlyDecidedViaTelegram.delete(approvalId);
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,12 +367,13 @@ function callbackButton(label, data) {
   return { text: label, callback_data: data };
 }
 
-function buildApprovalKeyboard(cfg, approvalId) {
+function buildApprovalKeyboard(cfg, approvalId, view = "note") {
   const rows = [];
   if (cfg.paperclipApiToken && approvalId) {
     rows.push([
-      callbackButton("✅ Approve", `approve:${approvalId}`),
-      callbackButton("❌ Reject", `reject:${approvalId}`),
+      callbackButton("✅ Approve", `approve.${view}:${approvalId}`),
+      callbackButton("❌ Reject", `reject.${view}:${approvalId}`),
+      callbackButton("💬 Comment", `approval.comment.${view}:${approvalId}`),
     ]);
   }
   const link = deepLink(cfg, "approval", approvalId);
@@ -363,6 +385,37 @@ function buildIssueKeyboard(cfg, issueId) {
   const link = deepLink(cfg, "issue", issueId);
   if (!link) return null;
   return { inline_keyboard: [[viewButton("Open in Paperclip", link)]] };
+}
+
+// Per-issue button row used inside a list view and in /open detail. The
+// "view" argument is stamped into callback_data so the callback handler
+// knows whether to re-render the list, the single-issue detail, or just
+// pop a confirmation.
+function buildIssueActionRow(cfg, issue, view) {
+  const row = [];
+  const link = deepLink(cfg, "issue", issue.id);
+  if (link)
+    row.push(viewButton(`👁 ${issue.identifier || fmtIdShort(issue.id)}`, link));
+  if (issue.id) {
+    if (issue.status === "done") {
+      row.push(callbackButton("🔁 Reopen", `issue.reopen.${view}:${issue.id}`));
+    } else {
+      row.push(callbackButton("✅ Done", `issue.done.${view}:${issue.id}`));
+    }
+    row.push(callbackButton("💬 Comment", `issue.comment.${view}:${issue.id}`));
+  }
+  return row;
+}
+
+function buildAgentActionRow(agent, view) {
+  if (!agent?.id) return [];
+  const row = [];
+  if (agent.status === "paused") {
+    row.push(callbackButton("▶️ Resume", `agent.resume.${view}:${agent.id}`));
+  } else if (agent.status !== "terminated") {
+    row.push(callbackButton("⏸ Pause", `agent.pause.${view}:${agent.id}`));
+  }
+  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +917,36 @@ async function handleStatusCommand(ctx, cfg, message) {
   await sendReply(ctx, cfg, message, lines.join("\n"));
 }
 
+function renderIssuesListView(cfg, issues) {
+  const lines = [`<b>Recent issues</b>`];
+  const inlineKeyboard = [];
+  if (!Array.isArray(issues) || issues.length === 0) {
+    lines.push("<i>(none)</i>");
+  } else {
+    for (const issue of issues.slice(0, COMMAND_MAX_ISSUES)) {
+      const ident = issue.identifier || fmtIdShort(issue.id || "");
+      const title = issue.title || "(untitled)";
+      const status = issue.status || "?";
+      const link = deepLink(cfg, "issue", issue.id);
+      const label = link
+        ? `<a href="${escapeHtml(link)}">${escapeHtml(ident)}</a>`
+        : `<b>${escapeHtml(ident)}</b>`;
+      lines.push(
+        `${statusEmoji(status)} ${label} — ${escapeHtml(truncate(title, 80))}`
+      );
+      const row = buildIssueActionRow(cfg, issue, "list");
+      if (row.length > 0) inlineKeyboard.push(row);
+    }
+  }
+  return {
+    text: lines.join("\n"),
+    reply_markup:
+      inlineKeyboard.length > 0
+        ? { inline_keyboard: inlineKeyboard }
+        : undefined,
+  };
+}
+
 async function handleIssuesCommand(ctx, cfg, message) {
   const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
   if (!companyId) {
@@ -877,52 +960,13 @@ async function handleIssuesCommand(ctx, cfg, message) {
       `/companies/${encodeURIComponent(companyId)}/issues?limit=${COMMAND_MAX_ISSUES}`
     )
   );
-  const lines = [`<b>Recent issues</b>`];
-  const inlineKeyboard = [];
-  if (!Array.isArray(listed) || listed.length === 0) {
-    lines.push("<i>(none)</i>");
-  } else {
-    for (const issue of listed.slice(0, COMMAND_MAX_ISSUES)) {
-      const ident = issue.identifier || fmtIdShort(issue.id || "");
-      const title = issue.title || "(untitled)";
-      const status = issue.status || "?";
-      const link = deepLink(cfg, "issue", issue.id);
-      const label = link
-        ? `<a href="${escapeHtml(link)}">${escapeHtml(ident)}</a>`
-        : `<b>${escapeHtml(ident)}</b>`;
-      lines.push(
-        `${statusEmoji(status)} ${label} — ${escapeHtml(truncate(title, 80))}`
-      );
-      const row = [];
-      if (link) row.push({ text: `👁 ${ident}`, url: link });
-      if (issue.id) {
-        if (status === "done") {
-          row.push({
-            text: "🔁 Reopen",
-            callback_data: `issue.reopen:${issue.id}`,
-          });
-        } else {
-          row.push({
-            text: "✅ Done",
-            callback_data: `issue.done:${issue.id}`,
-          });
-        }
-        row.push({
-          text: "💬 Comment",
-          callback_data: `issue.comment:${issue.id}`,
-        });
-      }
-      if (row.length > 0) inlineKeyboard.push(row);
-    }
-  }
+  const view = renderIssuesListView(cfg, listed);
   await sendReply(
     ctx,
     cfg,
     message,
-    lines.join("\n"),
-    inlineKeyboard.length > 0
-      ? { reply_markup: { inline_keyboard: inlineKeyboard } }
-      : {}
+    view.text,
+    view.reply_markup ? { reply_markup: view.reply_markup } : {}
   );
 }
 
@@ -965,6 +1009,17 @@ async function handleOpenCommand(ctx, cfg, message, args) {
     await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(arg)}`);
     return;
   }
+  const view = renderIssueDetailView(cfg, issue);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    view.text,
+    view.reply_markup ? { reply_markup: view.reply_markup } : {}
+  );
+}
+
+function renderIssueDetailView(cfg, issue) {
   const ident = issue.identifier || fmtIdShort(issue.id);
   const lines = [
     `<b>${escapeHtml(ident)}</b> ${escapeHtml(issue.title || "(untitled)")}`,
@@ -978,14 +1033,11 @@ async function handleOpenCommand(ctx, cfg, message, args) {
   if (meta.length > 0) lines.push(meta.join(" · "));
   const preview = bodyPreview(cfg, issue.description);
   if (preview) lines.push(`<i>${escapeHtml(preview)}</i>`);
-  const kb = buildIssueKeyboard(cfg, issue.id);
-  await sendReply(
-    ctx,
-    cfg,
-    message,
-    lines.join("\n"),
-    kb ? { reply_markup: kb } : {}
-  );
+  const row = buildIssueActionRow(cfg, issue, "open");
+  return {
+    text: lines.join("\n"),
+    reply_markup: row.length > 0 ? { inline_keyboard: [row] } : undefined,
+  };
 }
 
 async function handleNewCommand(ctx, cfg, message, args) {
@@ -1042,6 +1094,42 @@ async function handleNewCommand(ctx, cfg, message, args) {
   );
 }
 
+function renderApprovalsListView(cfg, pending) {
+  if (!Array.isArray(pending) || pending.length === 0) {
+    return {
+      text: "<b>Pending approvals</b>\n<i>(none)</i>",
+      reply_markup: undefined,
+    };
+  }
+  const lines = [`<b>Pending approvals (${pending.length})</b>`];
+  const inlineKeyboard = [];
+  for (const a of pending.slice(0, 10)) {
+    const tldr = renderApprovalTldr(cfg, a);
+    const subject = tldr ? tldr.split("\n")[0] : `type ${fmtCode(a.type)}`;
+    const link = deepLink(cfg, "approval", a.id);
+    const headLinked = link
+      ? `🟡 <a href="${escapeHtml(link)}">${escapeHtml(fmtIdShort(a.id))}</a>`
+      : `🟡 ${fmtCode(fmtIdShort(a.id))}`;
+    lines.push(`${headLinked} — ${subject}`);
+    if (cfg.paperclipApiToken) {
+      inlineKeyboard.push([
+        callbackButton(`✅ ${fmtIdShort(a.id)}`, `approve.list:${a.id}`),
+        callbackButton(`❌ ${fmtIdShort(a.id)}`, `reject.list:${a.id}`),
+        callbackButton(`💬 ${fmtIdShort(a.id)}`, `approval.comment.list:${a.id}`),
+      ]);
+    } else if (link) {
+      inlineKeyboard.push([viewButton(`Open ${fmtIdShort(a.id)}`, link)]);
+    }
+  }
+  return {
+    text: lines.join("\n"),
+    reply_markup:
+      inlineKeyboard.length > 0
+        ? { inline_keyboard: inlineKeyboard }
+        : undefined,
+  };
+}
+
 async function handleApprovalsCommand(ctx, cfg, message) {
   if (!cfg.paperclipApiToken) {
     await sendReply(
@@ -1059,35 +1147,25 @@ async function handleApprovalsCommand(ctx, cfg, message) {
     await sendReply(ctx, cfg, message, "Could not fetch approvals.");
     return;
   }
-  if (pending.length === 0) {
-    await sendReply(ctx, cfg, message, "<b>Pending approvals</b>\n<i>(none)</i>");
-    return;
-  }
-  const lines = [`<b>Pending approvals (${pending.length})</b>`];
-  for (const a of pending.slice(0, 20)) {
-    const tldr = renderApprovalTldr(cfg, a);
-    const head = `🟡 ${fmtCode(fmtIdShort(a.id))}`;
-    const subject = tldr ? tldr.split("\n")[0] : `type ${fmtCode(a.type)}`;
-    const link = deepLink(cfg, "approval", a.id);
-    const headLinked = link
-      ? `🟡 <a href="${escapeHtml(link)}">${escapeHtml(fmtIdShort(a.id))}</a>`
-      : head;
-    lines.push(`${headLinked} — ${subject}`);
-  }
-  await sendReply(ctx, cfg, message, lines.join("\n"));
+  const view = renderApprovalsListView(cfg, pending);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    view.text,
+    view.reply_markup ? { reply_markup: view.reply_markup } : {}
+  );
 }
 
-async function handleAgentsCommand(ctx, cfg, message) {
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
-  if (!companyId) return;
-  const agents = asArray(
-    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
-  );
+function renderAgentsListView(cfg, agents) {
   if (!Array.isArray(agents) || agents.length === 0) {
-    await sendReply(ctx, cfg, message, "<b>Agents</b>\n<i>(none)</i>");
-    return;
+    return {
+      text: "<b>Agents</b>\n<i>(none)</i>",
+      reply_markup: undefined,
+    };
   }
   const lines = [`<b>Agents (${agents.length})</b>`];
+  const inlineKeyboard = [];
   for (const a of agents.slice(0, 25)) {
     const name = a.displayName || a.name || fmtIdShort(a.id || "");
     const status = a.status || "?";
@@ -1096,8 +1174,40 @@ async function handleAgentsCommand(ctx, cfg, message) {
     if (role) bits.push(fmtCode(role));
     bits.push(fmtCode(status));
     lines.push(bits.join(" · "));
+    if (cfg.paperclipApiToken) {
+      const actionRow = buildAgentActionRow(a, "list");
+      // Tag the buttons with the agent name for clarity in a multi-row list.
+      const labelled = actionRow.map((b) =>
+        b.callback_data
+          ? { ...b, text: `${b.text} ${name}`.slice(0, 60) }
+          : b
+      );
+      if (labelled.length > 0) inlineKeyboard.push(labelled);
+    }
   }
-  await sendReply(ctx, cfg, message, lines.join("\n"));
+  return {
+    text: lines.join("\n"),
+    reply_markup:
+      inlineKeyboard.length > 0
+        ? { inline_keyboard: inlineKeyboard }
+        : undefined,
+  };
+}
+
+async function handleAgentsCommand(ctx, cfg, message) {
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  if (!companyId) return;
+  const agents = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
+  );
+  const view = renderAgentsListView(cfg, agents);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    view.text,
+    view.reply_markup ? { reply_markup: view.reply_markup } : {}
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,7 +1674,107 @@ async function callPaperclip(ctx, cfg, pathRel, body) {
   return pcRequest(ctx, cfg, "POST", pathRel, body ?? {});
 }
 
-async function handleIssueCallback(ctx, cfg, query, action, issueId) {
+// View-aware refresh helpers — used by callbacks to edit the source
+// message in place after an action so the UI reflects the new state
+// without sending a fresh notification.
+
+async function refreshIssuesListMessage(ctx, cfg, query) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const userId = query.from?.id || null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  if (!companyId) return;
+  const issues = asArray(
+    await pcGet(
+      ctx,
+      cfg,
+      `/companies/${encodeURIComponent(companyId)}/issues?limit=${COMMAND_MAX_ISSUES}`
+    )
+  );
+  const view = renderIssuesListView(cfg, issues);
+  await tg.editMessageText({
+    chat_id: query.message.chat.id,
+    message_id: query.message.message_id,
+    text: clampMessage(view.text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: view.reply_markup || { inline_keyboard: [] },
+  });
+}
+
+async function refreshIssueDetailMessage(ctx, cfg, query, issueId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const issue = await pcGet(ctx, cfg, `/issues/${encodeURIComponent(issueId)}`);
+  if (!issue) return;
+  const view = renderIssueDetailView(cfg, issue);
+  await tg.editMessageText({
+    chat_id: query.message.chat.id,
+    message_id: query.message.message_id,
+    text: clampMessage(view.text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: view.reply_markup || { inline_keyboard: [] },
+  });
+}
+
+async function refreshApprovalsListMessage(ctx, cfg, query) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const userId = query.from?.id || null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  if (!companyId) return;
+  const pending = await fetchPendingApprovals(ctx, cfg, companyId);
+  const view = renderApprovalsListView(cfg, pending || []);
+  await tg.editMessageText({
+    chat_id: query.message.chat.id,
+    message_id: query.message.message_id,
+    text: clampMessage(view.text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: view.reply_markup || { inline_keyboard: [] },
+  });
+}
+
+async function refreshAgentsListMessage(ctx, cfg, query) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const userId = query.from?.id || null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  if (!companyId) return;
+  const agents = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
+  );
+  const view = renderAgentsListView(cfg, agents);
+  await tg.editMessageText({
+    chat_id: query.message.chat.id,
+    message_id: query.message.message_id,
+    text: clampMessage(view.text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: view.reply_markup || { inline_keyboard: [] },
+  });
+}
+
+async function sendCommentPrompt(ctx, cfg, query, entityType, entityId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  const label = entityType === "approval" ? "approval" : "issue";
+  const promptText = `💬 Reply to this message with your comment for ${label} ${fmtCode(
+    fmtIdShort(entityId)
+  )}`;
+  const r = await tg.sendMessage({
+    chat_id: query.message.chat.id,
+    message_thread_id: query.message.message_thread_id ?? undefined,
+    text: promptText,
+    parse_mode: "HTML",
+    reply_markup: { force_reply: true, selective: true },
+  });
+  if (r.ok) {
+    await rememberEntityRef(ctx, r, { type: entityType, id: entityId });
+  }
+  await tg.answerCallbackQuery({
+    callback_query_id: query.id,
+    text: "Reply to the prompt to add your comment",
+  });
+}
+
+async function handleIssueCallback(ctx, cfg, query, action, view, issueId) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   if (!cfg.paperclipApiToken) {
     await tg.answerCallbackQuery({
@@ -1573,6 +1783,9 @@ async function handleIssueCallback(ctx, cfg, query, action, issueId) {
       show_alert: true,
     });
     return;
+  }
+  if (action === "comment") {
+    return sendCommentPrompt(ctx, cfg, query, "issue", issueId);
   }
   if (action === "done" || action === "reopen") {
     const newStatus = action === "done" ? "done" : "todo";
@@ -1592,35 +1805,129 @@ async function handleIssueCallback(ctx, cfg, query, action, issueId) {
         : `Failed (${result.status})`,
       show_alert: !result.ok,
     });
-    return;
-  }
-  if (action === "comment") {
-    // Prompt the user for the comment body via force_reply; the resulting
-    // reply will route through handleReplyAsComment because we record the
-    // entity ref on this prompt message.
-    const promptText = `💬 Reply to this message with your comment for issue ${fmtCode(
-      fmtIdShort(issueId)
-    )}`;
-    const r = await tg.sendMessage({
-      chat_id: query.message.chat.id,
-      message_thread_id: query.message.message_thread_id ?? undefined,
-      text: promptText,
-      parse_mode: "HTML",
-      reply_markup: { force_reply: true, selective: true },
-    });
-    if (r.ok) {
-      await rememberEntityRef(ctx, r, { type: "issue", id: issueId });
+    if (result.ok) {
+      try {
+        if (view === "list") await refreshIssuesListMessage(ctx, cfg, query);
+        else if (view === "open")
+          await refreshIssueDetailMessage(ctx, cfg, query, issueId);
+        // view "note" or unknown: leave the original message alone.
+      } catch (err) {
+        ctx.logger.warn("refresh after issue action failed", {
+          err: String(err),
+          view,
+          issueId,
+        });
+      }
     }
-    await tg.answerCallbackQuery({
-      callback_query_id: query.id,
-      text: "Reply to the prompt to add your comment",
-    });
     return;
   }
   await tg.answerCallbackQuery({
     callback_query_id: query.id,
     text: `Unknown issue action: ${action}`,
   });
+}
+
+async function handleApprovalDecideCallback(ctx, cfg, query, action, view, approvalId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  if (!cfg.paperclipApiToken) {
+    await tg.answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "Approve / Reject requires paperclipApiToken to be set in plugin config.",
+      show_alert: true,
+    });
+    return;
+  }
+  const path =
+    action === "approve"
+      ? `/approvals/${approvalId}/approve`
+      : `/approvals/${approvalId}/reject`;
+  // Mark BEFORE the REST call: the host emits `approval.decided` to plugin
+  // event handlers from inside the route's activity-log write, which can
+  // race ahead of our REST response. A pre-mark wins the race. On failure
+  // we drop the mark — no decision was made, so no event will fire.
+  markRecentlyDecidedViaTelegram(approvalId);
+  const result = await callPaperclip(ctx, cfg, path, {
+    decisionNote: `Via Telegram by ${query.from?.username || query.from?.first_name || "user"}`,
+  });
+  const ok = result.ok;
+  if (!ok) recentlyDecidedViaTelegram.delete(approvalId);
+  await tg.answerCallbackQuery({
+    callback_query_id: query.id,
+    text: ok
+      ? action === "approve"
+        ? "Approved ✅"
+        : "Rejected ❌"
+      : `Failed (${result.status}): ${truncate(JSON.stringify(result.body), 120)}`,
+    show_alert: !ok,
+  });
+  if (!ok) return;
+
+  if (view === "list") {
+    try {
+      await refreshApprovalsListMessage(ctx, cfg, query);
+    } catch (err) {
+      ctx.logger.warn("refresh approvals list failed", { err: String(err) });
+    }
+    return;
+  }
+  // Notification view (default): annotate the original text and collapse
+  // the action row to just the deep-link button.
+  if (query.message) {
+    const original = query.message.text || query.message.caption || "";
+    const who = escapeHtml(
+      query.from?.username || query.from?.first_name || "user"
+    );
+    const decoration =
+      action === "approve"
+        ? `\n\n<b>✅ Approved</b> by ${who}`
+        : `\n\n<b>❌ Rejected</b> by ${who}`;
+    const link = deepLink(cfg, "approval", approvalId);
+    const replacement = link
+      ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
+      : { inline_keyboard: [] };
+    await tg.editMessageText({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      text: clampMessage(original + decoration),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: replacement,
+    });
+  }
+}
+
+async function handleAgentCallback(ctx, cfg, query, action, view, agentId) {
+  const tg = createTelegram(ctx, (cfg.botToken || "").trim());
+  if (!cfg.paperclipApiToken) {
+    await tg.answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "Agent actions require paperclipApiToken to be set in plugin config.",
+      show_alert: true,
+    });
+    return;
+  }
+  const result = await callPaperclip(
+    ctx,
+    cfg,
+    `/agents/${encodeURIComponent(agentId)}/${action}`,
+    {}
+  );
+  await tg.answerCallbackQuery({
+    callback_query_id: query.id,
+    text: result.ok
+      ? action === "pause"
+        ? "Paused ⏸"
+        : "Resumed ▶️"
+      : `Failed (${result.status})`,
+    show_alert: !result.ok,
+  });
+  if (result.ok && view === "list") {
+    try {
+      await refreshAgentsListMessage(ctx, cfg, query);
+    } catch (err) {
+      ctx.logger.warn("refresh agents list failed", { err: String(err) });
+    }
+  }
 }
 
 async function handleWorkspaceSwitchCallback(ctx, cfg, query, companyId) {
@@ -1650,72 +1957,73 @@ async function handleWorkspaceSwitchCallback(ctx, cfg, query, companyId) {
 async function handleCallbackQuery(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const data = String(query.data || "");
+
+  // Workspace switching (existing).
   const wsMatch = data.match(/^ws\.use:([0-9a-f-]{36})$/i);
   if (wsMatch) {
     return handleWorkspaceSwitchCallback(ctx, cfg, query, wsMatch[1]);
   }
-  const issueMatch = data.match(/^issue\.(done|reopen|comment):([0-9a-f-]{36})$/i);
+
+  // Issue actions — view-aware: issue.<action>[.<view>]:<uuid>
+  // view defaults to "list" for backwards compat with older messages.
+  const issueMatch = data.match(
+    /^issue\.(done|reopen|comment)(?:\.([a-z]+))?:([0-9a-f-]{36})$/i
+  );
   if (issueMatch) {
-    return handleIssueCallback(ctx, cfg, query, issueMatch[1].toLowerCase(), issueMatch[2]);
+    return handleIssueCallback(
+      ctx,
+      cfg,
+      query,
+      issueMatch[1].toLowerCase(),
+      (issueMatch[2] || "list").toLowerCase(),
+      issueMatch[3]
+    );
   }
-  const m = data.match(/^(approve|reject):([a-f0-9-]{8,})$/i);
-  if (!m) {
-    await tg.answerCallbackQuery({
-      callback_query_id: query.id,
-      text: "Unrecognized button",
-    });
-    return;
+
+  // Agent actions — agent.<pause|resume>[.<view>]:<uuid>
+  const agentMatch = data.match(
+    /^agent\.(pause|resume)(?:\.([a-z]+))?:([0-9a-f-]{36})$/i
+  );
+  if (agentMatch) {
+    return handleAgentCallback(
+      ctx,
+      cfg,
+      query,
+      agentMatch[1].toLowerCase(),
+      (agentMatch[2] || "list").toLowerCase(),
+      agentMatch[3]
+    );
   }
-  const action = m[1];
-  const approvalId = m[2];
-  if (!cfg.paperclipApiToken) {
-    await tg.answerCallbackQuery({
-      callback_query_id: query.id,
-      text: "Approve/reject requires paperclipApiToken to be set in plugin config.",
-      show_alert: true,
-    });
-    return;
+
+  // Approval comment — approval.comment[.<view>]:<uuid>
+  const apprComment = data.match(
+    /^approval\.comment(?:\.([a-z]+))?:([0-9a-f-]{8,})$/i
+  );
+  if (apprComment) {
+    return sendCommentPrompt(ctx, cfg, query, "approval", apprComment[2]);
   }
-  const path = action === "approve"
-    ? `/approvals/${approvalId}/approve`
-    : `/approvals/${approvalId}/reject`;
-  const result = await callPaperclip(ctx, cfg, path, {
-    decisionNote: `Via Telegram by ${query.from?.username || query.from?.first_name || "user"}`,
-  });
-  const ok = result.ok;
+
+  // Approve / Reject — supports both legacy "approve:id" and new
+  // "approve.<view>:id". view defaults to "note" so legacy callback_data
+  // on existing notifications keeps working.
+  const apprDecide = data.match(
+    /^(approve|reject)(?:\.([a-z]+))?:([a-f0-9-]{8,})$/i
+  );
+  if (apprDecide) {
+    return handleApprovalDecideCallback(
+      ctx,
+      cfg,
+      query,
+      apprDecide[1].toLowerCase(),
+      (apprDecide[2] || "note").toLowerCase(),
+      apprDecide[3]
+    );
+  }
+
   await tg.answerCallbackQuery({
     callback_query_id: query.id,
-    text: ok
-      ? action === "approve"
-        ? "Approved ✅"
-        : "Rejected ❌"
-      : `Failed (${result.status}): ${truncate(JSON.stringify(result.body), 120)}`,
-    show_alert: !ok,
+    text: "Unrecognized button",
   });
-  if (ok && query.message) {
-    const original = query.message.text || query.message.caption || "";
-    const who = escapeHtml(
-      query.from?.username || query.from?.first_name || "user"
-    );
-    const decoration = action === "approve"
-      ? `\n\n<b>✅ Approved</b> by ${who}`
-      : `\n\n<b>❌ Rejected</b> by ${who}`;
-    // Replace the action buttons with just the deep-link button so the user
-    // can still open the approval in Paperclip for context, but can't
-    // double-decide.
-    const link = deepLink(cfg, "approval", approvalId);
-    const replacement = link
-      ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
-      : { inline_keyboard: [] };
-    await tg.editMessageText({
-      chat_id: query.message.chat.id,
-      message_id: query.message.message_id,
-      text: clampMessage(original + decoration),
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: replacement,
-    });
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1875,6 +2183,15 @@ const plugin = definePlugin({
       safe("approval.decided", async (event) => {
         const cfg = await gate(event, "approvalDecided", true);
         if (!cfg) return;
+        // Skip if this approval was just decided via a Telegram inline
+        // button — the user already saw the result land on the original
+        // message and doesn't need a duplicate ping.
+        if (wasRecentlyDecidedViaTelegram(event.entityId)) {
+          ctx.logger.info("skipping approval.decided (recently decided via Telegram)", {
+            approvalId: event.entityId,
+          });
+          return;
+        }
         const html = await fmtApprovalDecided(ctx, event, cfg);
         // No action buttons on already-decided approvals; just a deep link.
         const link = deepLink(cfg, "approval", event.entityId);
