@@ -40,6 +40,8 @@ In the plugin's settings page in Paperclip, fill in:
 | `defaultChatId` | ✓ | Where messages should go |
 | `paperclipPublicUrl` |   | Your Paperclip URL (e.g. `https://paperclip.example.com`). Needed for deep links, slash commands, and inline buttons |
 | `paperclipApiToken` |   | A Paperclip bearer token for *you*. Once it's set, the bot can do things on your behalf — approve, mark done, create issues, the lot |
+| `digestChatId` |   | Chat for the scheduled daily digest. Falls back to `defaultChatId`. |
+| `digestTopicId` |   | Forum topic for the digest. Falls back to `defaultTopicId`. |
 
 Everything else (per-event on/off switches, per-category chat routing,
 allow-lists, default company, webhook secret) lives in
@@ -55,11 +57,14 @@ Type `/help` in the bot to see this list right inside Telegram.
 | --- | --- |
 | `/workspaces` (or `/companies`) | Lists your companies. Each row is a tap-to-switch button. |
 | `/use <name>` | Same thing from the keyboard, if you'd rather type |
+| `/connect <name>` | Bind *this chat* to a workspace. Beats `/use` — useful for a chat dedicated to one company. |
 
 Each person gets their own active workspace. **Heads up:** notifications
 fire for *every* workspace regardless — your active one only changes
 which company the commands look at. Every notification header tells you
-which workspace it came from (e.g. `· 🏢 Helpy`).
+which workspace it came from (e.g. `· 🏢 Helpy`). The resolution order
+inside any chat is: per-chat `/connect` → per-user `/use` →
+`defaultCompanyId` → first visible company.
 
 ### Looking around
 
@@ -70,6 +75,7 @@ which workspace it came from (e.g. `· 🏢 Helpy`).
 | `/open <id>` | One issue in detail (works with `REA-123` or the UUID) |
 | `/approvals` | What's waiting for you to approve |
 | `/agents` | Who's idle, who's running, who's blocked |
+| `/digest` | On-demand 24h summary for the active workspace (closed/new issues, open approvals, busy agents). Also runs daily on a schedule — see below. |
 | `/help` | This list, in the chat |
 
 ### Doing things
@@ -80,8 +86,36 @@ which workspace it came from (e.g. `· 🏢 Helpy`).
 | `/comment <id> <text>` | Add a comment to an issue |
 | `/done <id>` | Mark an issue done |
 | `/reopen <id>` | Bring a closed issue back to `todo` |
+| `/approve <id>` | Approve an approval — full UUID or 8-char prefix |
+| `/reject <id>` | Reject an approval — full UUID or 8-char prefix |
 | `/pause <agent>` | Pause an agent |
 | `/resume <agent>` | Resume them |
+
+### Routing per project
+
+In a forum-style supergroup you can split notifications into per-project
+topics without touching the manifest:
+
+| Command | What it does |
+| --- | --- |
+| `/topics list` | Show current project → topic mappings for this chat |
+| `/topics add <project> <topicId>` | Route a project's events into a specific forum topic |
+| `/topics remove <project>` | Drop a single mapping |
+| `/topics clear` | Drop them all |
+
+`<project>` accepts a project UUID or a name (case-insensitive). Mappings
+live in plugin state and apply *to this chat only* — when an event
+carries a `payload.projectId` that matches a mapping for the chat it's
+routed to, the topic override kicks in. Per-category routing
+(`routing.issues.chatId`, …) still decides which chat receives the
+event; `/topics` only changes the forum topic within it.
+
+### Daily digest
+
+The plugin declares a scheduled job (`telegram-daily-digest`, cron
+`0 9 * * *`) that posts a per-workspace summary to `digestChatId`
+(falls back to `defaultChatId`, with `digestTopicId` for the forum
+topic). Run `/digest` to fire one on-demand for your active workspace.
 
 ### Tapping buttons
 

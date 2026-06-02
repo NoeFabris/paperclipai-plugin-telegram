@@ -20,7 +20,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 const TELEGRAM_API = "https://api.telegram.org";
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const COMMAND_MAX_ISSUES = 10;
 const TELEGRAM_HARD_LIMIT = 4000; // Bot API limit is 4096; keep a margin.
 
@@ -296,6 +296,23 @@ async function dispatchMessage(ctx, cfg, eventType, html, extra = {}, entityRef 
     ctx.logger.warn("no botToken — dropping message", { eventType });
     return;
   }
+  // Per-project topic override: if the event carries a projectId and the
+  // destination chat has a /topics mapping for it, route into that topic.
+  // The mapping is keyed off the *routed* chat (the place the notification
+  // actually lands), not whatever chat ran /topics — those are usually the
+  // same in practice, and explicitly tying the mapping to the destination
+  // keeps the override predictable from inside the chat.
+  let topicId = route.topicId;
+  const projectId = entityRef?.projectId;
+  if (projectId) {
+    try {
+      const map = await getChatProjectTopics(ctx, route.chatId);
+      const mapped = map[projectId];
+      if (Number.isInteger(mapped)) topicId = mapped;
+    } catch (err) {
+      ctx.logger.warn("project topic lookup failed", { err: String(err) });
+    }
+  }
   const tg = createTelegram(ctx, token);
   const body = {
     chat_id: route.chatId,
@@ -304,7 +321,7 @@ async function dispatchMessage(ctx, cfg, eventType, html, extra = {}, entityRef 
     disable_web_page_preview: true,
     ...extra,
   };
-  if (route.topicId != null) body.message_thread_id = route.topicId;
+  if (topicId != null) body.message_thread_id = topicId;
   const r = await tg.sendMessage(body);
   if (entityRef && r.ok) {
     await rememberEntityRef(ctx, r, entityRef);
@@ -721,6 +738,7 @@ async function ensureCommandsRegistered(ctx, cfg) {
       { command: "status", description: "Plugin + instance status & counts" },
       { command: "workspaces", description: "List workspaces (companies)" },
       { command: "use", description: "Switch active workspace (/use <name>)" },
+      { command: "connect", description: "Bind this chat to a workspace (/connect <name>)" },
       { command: "issues", description: "Recent issues (with action buttons)" },
       { command: "open", description: "Show one issue (/open PCL-123)" },
       { command: "new", description: "Create an issue (/new <title>)" },
@@ -728,9 +746,13 @@ async function ensureCommandsRegistered(ctx, cfg) {
       { command: "done", description: "Mark issue done (/done <id>)" },
       { command: "reopen", description: "Reopen an issue (/reopen <id>)" },
       { command: "approvals", description: "List pending approvals" },
+      { command: "approve", description: "Approve an approval (/approve <id>)" },
+      { command: "reject", description: "Reject an approval (/reject <id>)" },
       { command: "agents", description: "List agents and their status" },
       { command: "pause", description: "Pause an agent (/pause <id or name>)" },
       { command: "resume", description: "Resume an agent (/resume <id or name>)" },
+      { command: "topics", description: "Per-chat project → topic routing (/topics list|add|remove|clear)" },
+      { command: "digest", description: "On-demand 24h workspace digest" },
     ],
   });
 }
@@ -777,7 +799,79 @@ async function setUserActiveCompany(ctx, userId, companyId) {
   }
 }
 
-async function resolveCompanyId(ctx, cfg, userId = null) {
+// Per-chat "connected workspace" persisted in plugin state. Set via
+// /connect <company>; takes precedence over the per-user active workspace
+// so a dedicated workspace channel always reads the same company even when
+// different humans run commands in it.
+async function getChatConnectedCompany(ctx, chatId) {
+  if (chatId == null) return null;
+  try {
+    const v = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `tg:chat:${chatId}:connectedCompany`,
+    });
+    return v && typeof v.companyId === "string" ? v.companyId : null;
+  } catch (err) {
+    ctx.logger.warn("getChatConnectedCompany failed", { err: String(err) });
+    return null;
+  }
+}
+
+async function setChatConnectedCompany(ctx, chatId, companyId) {
+  if (chatId == null || !companyId) return;
+  try {
+    await ctx.state.set(
+      {
+        scopeKind: "instance",
+        stateKey: `tg:chat:${chatId}:connectedCompany`,
+      },
+      { companyId, savedAt: new Date().toISOString() }
+    );
+  } catch (err) {
+    ctx.logger.warn("setChatConnectedCompany failed", { err: String(err) });
+  }
+}
+
+// Per-chat project → topic mapping. When an event has a `payload.projectId`
+// that matches a key here, resolveRoute's topicId is overridden so the
+// notification lands in the project-specific forum topic.
+async function getChatProjectTopics(ctx, chatId) {
+  if (chatId == null) return {};
+  try {
+    const v = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `tg:chat:${chatId}:projectTopics`,
+    });
+    return v && typeof v === "object" && v.map && typeof v.map === "object"
+      ? v.map
+      : {};
+  } catch (err) {
+    ctx.logger.warn("getChatProjectTopics failed", { err: String(err) });
+    return {};
+  }
+}
+
+async function setChatProjectTopics(ctx, chatId, map) {
+  if (chatId == null) return;
+  try {
+    await ctx.state.set(
+      {
+        scopeKind: "instance",
+        stateKey: `tg:chat:${chatId}:projectTopics`,
+      },
+      { map: map || {}, savedAt: new Date().toISOString() }
+    );
+  } catch (err) {
+    ctx.logger.warn("setChatProjectTopics failed", { err: String(err) });
+  }
+}
+
+async function resolveCompanyId(ctx, cfg, userId = null, chatId = null) {
+  // Order: per-chat connected → per-user active → cfg.defaultCompanyId →
+  // first visible. chatId is optional so existing call sites that only
+  // know the user keep working (they just skip the chat tier).
+  const chatConnected = await getChatConnectedCompany(ctx, chatId);
+  if (chatConnected) return chatConnected;
   const userActive = await getUserActiveCompany(ctx, userId);
   if (userActive) return userActive;
   if (
@@ -853,6 +947,7 @@ function helpText() {
     "<b>Workspaces</b>",
     "<code>/workspaces</code>      — list companies, mark the active one",
     "<code>/use &lt;name&gt;</code>      — switch your active workspace",
+    "<code>/connect &lt;name&gt;</code>  — bind this chat to a workspace",
     "",
     "<b>Read</b>",
     "<code>/status</code>          — plugin + active workspace counts",
@@ -860,14 +955,23 @@ function helpText() {
     "<code>/open &lt;id&gt;</code>       — show one issue (identifier or UUID)",
     "<code>/approvals</code>       — list pending approvals",
     "<code>/agents</code>          — list agents and their status",
+    "<code>/digest</code>          — on-demand 24h summary for active workspace",
     "",
     "<b>Write</b>",
     "<code>/new &lt;title&gt;</code>     — create an issue in the default project",
     "<code>/comment &lt;id&gt; &lt;text&gt;</code> — add a comment to an issue",
     "<code>/done &lt;id&gt;</code>       — mark issue done",
     "<code>/reopen &lt;id&gt;</code>     — reopen a closed issue",
+    "<code>/approve &lt;id&gt;</code>    — approve an approval (UUID or 8-char prefix)",
+    "<code>/reject &lt;id&gt;</code>     — reject an approval (UUID or 8-char prefix)",
     "<code>/pause &lt;agent&gt;</code>   — pause an agent",
     "<code>/resume &lt;agent&gt;</code>  — resume an agent",
+    "",
+    "<b>Routing</b>",
+    "<code>/topics list</code>       — show per-project topic mappings for this chat",
+    "<code>/topics add &lt;project&gt; &lt;topicId&gt;</code> — route a project's events to a forum topic",
+    "<code>/topics remove &lt;project&gt;</code> — drop a mapping",
+    "<code>/topics clear</code>      — drop all mappings for this chat",
     "",
     "<b>Reply / inline buttons</b>",
     "Replying to any notification (or the 💬 Comment prompt) posts the reply as a comment on the source entity. /issues rows include ✅ Done / 🔁 Reopen / 💬 Comment buttons that act on your behalf.",
@@ -883,7 +987,7 @@ async function handleStatusCommand(ctx, cfg, message) {
     `default chat: ${fmtCode(cfg.defaultChatId || "?")}`,
     `mutation api: ${cfg.paperclipApiToken ? "✅ configured" : "❌ disabled"}`,
   ];
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (companyId) {
     const companies = asArray(await pcGet(ctx, cfg, "/companies"));
     const company = companies.find((c) => c.id === companyId);
@@ -948,7 +1052,7 @@ function renderIssuesListView(cfg, issues) {
 }
 
 async function handleIssuesCommand(ctx, cfg, message) {
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -981,7 +1085,7 @@ async function handleOpenCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -1051,7 +1155,7 @@ async function handleNewCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (!companyId) {
     await sendReply(ctx, cfg, message, "No company visible to this plugin.");
     return;
@@ -1140,7 +1244,7 @@ async function handleApprovalsCommand(ctx, cfg, message) {
     );
     return;
   }
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (!companyId) return;
   const pending = await fetchPendingApprovals(ctx, cfg, companyId);
   if (!Array.isArray(pending)) {
@@ -1195,7 +1299,7 @@ function renderAgentsListView(cfg, agents) {
 }
 
 async function handleAgentsCommand(ctx, cfg, message) {
-  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null);
+  const companyId = await resolveCompanyId(ctx, cfg, message.from?.id || null, message.chat?.id ?? null);
   if (!companyId) return;
   const agents = asArray(
     await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
@@ -1277,11 +1381,11 @@ async function handleReplyAsComment(ctx, cfg, message) {
 // Agent + comment commands
 // ---------------------------------------------------------------------------
 
-async function resolveAgentId(ctx, cfg, arg, userId = null) {
+async function resolveAgentId(ctx, cfg, arg, userId = null, chatId = null) {
   const needle = String(arg || "").trim();
   if (!needle) return null;
   if (isUuidLike(needle)) return needle;
-  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  const companyId = await resolveCompanyId(ctx, cfg, userId, chatId);
   if (!companyId) return null;
   const agents = asArray(
     await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
@@ -1304,11 +1408,11 @@ async function resolveAgentId(ctx, cfg, arg, userId = null) {
   return match?.id || null;
 }
 
-async function resolveIssueId(ctx, cfg, arg, userId = null) {
+async function resolveIssueId(ctx, cfg, arg, userId = null, chatId = null) {
   const needle = String(arg || "").trim();
   if (!needle) return null;
   if (isUuidLike(needle)) return needle;
-  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  const companyId = await resolveCompanyId(ctx, cfg, userId, chatId);
   if (!companyId) return null;
   const issues = asArray(
     await pcGet(
@@ -1340,7 +1444,7 @@ async function handleCommentCommand(ctx, cfg, message, args) {
     );
     return;
   }
-  const issueId = await resolveIssueId(ctx, cfg, ref, message.from?.id || null);
+  const issueId = await resolveIssueId(ctx, cfg, ref, message.from?.id || null, message.chat?.id ?? null);
   if (!issueId) {
     await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(ref)}`);
     return;
@@ -1383,7 +1487,7 @@ async function handleAgentLifecycle(ctx, cfg, message, args, action) {
     );
     return;
   }
-  const agentId = await resolveAgentId(ctx, cfg, arg, message.from?.id || null);
+  const agentId = await resolveAgentId(ctx, cfg, arg, message.from?.id || null, message.chat?.id ?? null);
   if (!agentId) {
     await sendReply(ctx, cfg, message, `Agent not found: ${fmtCode(arg)}`);
     return;
@@ -1450,7 +1554,8 @@ async function handleWorkspacesCommand(ctx, cfg, message) {
     return;
   }
   const userId = message.from?.id || null;
-  const active = await resolveCompanyId(ctx, cfg, userId);
+  const chatId = message.chat?.id ?? null;
+  const active = await resolveCompanyId(ctx, cfg, userId, chatId);
   const view = renderWorkspacesView(companies, active);
   await sendReply(ctx, cfg, message, view.text, { reply_markup: view.keyboard });
 }
@@ -1511,7 +1616,7 @@ async function handleIssueStatusChange(ctx, cfg, message, args, targetStatus) {
     );
     return;
   }
-  const issueId = await resolveIssueId(ctx, cfg, arg, message.from?.id || null);
+  const issueId = await resolveIssueId(ctx, cfg, arg, message.from?.id || null, message.chat?.id ?? null);
   if (!issueId) {
     await sendReply(ctx, cfg, message, `Issue not found: ${fmtCode(arg)}`);
     return;
@@ -1545,6 +1650,495 @@ async function handleIssueStatusChange(ctx, cfg, message, args, targetStatus) {
         truncate(JSON.stringify(result.body || {}), 200)
       )}`
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /connect — bind this chat to a specific company
+// ---------------------------------------------------------------------------
+
+async function handleConnectCommand(ctx, cfg, message, args) {
+  const arg = String(args || "").trim();
+  if (!arg) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      "Usage: <code>/connect &lt;company name or id&gt;</code>"
+    );
+    return;
+  }
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  if (companies.length === 0) {
+    await sendReply(ctx, cfg, message, "No companies visible to this plugin.");
+    return;
+  }
+  const lower = arg.toLowerCase();
+  let match = null;
+  if (isUuidLike(arg)) match = companies.find((c) => c.id === arg);
+  if (!match)
+    match = companies.find((c) => c.name && c.name.toLowerCase() === lower);
+  if (!match)
+    match = companies.find(
+      (c) => c.name && c.name.toLowerCase().startsWith(lower)
+    );
+  if (!match)
+    match = companies.find((c) => c.id && c.id.startsWith(arg));
+  if (!match) {
+    await sendReply(ctx, cfg, message, `No workspace matches ${fmtCode(arg)}`);
+    return;
+  }
+  const chatId = message.chat?.id ?? null;
+  if (chatId == null) {
+    await sendReply(ctx, cfg, message, "Could not determine chat id.");
+    return;
+  }
+  await setChatConnectedCompany(ctx, chatId, match.id);
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    `🔗 This chat is now connected to <b>${escapeHtml(
+      match.name || fmtIdShort(match.id)
+    )}</b>. Commands in this chat will default to that workspace until you /connect another.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /approve <id> /reject <id> — standalone approval decisions
+// ---------------------------------------------------------------------------
+
+async function resolveApprovalId(ctx, cfg, arg, companyId) {
+  const needle = String(arg || "").trim();
+  if (!needle) return null;
+  if (isUuidLike(needle)) return needle;
+  // 8-char (or longer prefix) — list pending approvals and match by id prefix.
+  if (!companyId) return null;
+  const pending = await fetchPendingApprovals(ctx, cfg, companyId);
+  if (!Array.isArray(pending)) return null;
+  const match = pending.find(
+    (a) => typeof a.id === "string" && a.id.toLowerCase().startsWith(needle.toLowerCase())
+  );
+  return match?.id || null;
+}
+
+async function handleApprovalDecisionCommand(ctx, cfg, message, args, action) {
+  const arg = String(args || "").trim();
+  if (!arg) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Usage: <code>/${action} &lt;approval id or 8-char prefix&gt;</code>`
+    );
+    return;
+  }
+  if (!cfg.paperclipApiToken) {
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `<i>Set paperclipApiToken in plugin config to ${action} approvals.</i>`
+    );
+    return;
+  }
+  const companyId = await resolveCompanyId(
+    ctx,
+    cfg,
+    message.from?.id || null,
+    message.chat?.id ?? null
+  );
+  const approvalId = await resolveApprovalId(ctx, cfg, arg, companyId);
+  if (!approvalId) {
+    await sendReply(ctx, cfg, message, `Approval not found: ${fmtCode(arg)}`);
+    return;
+  }
+  // Mirror the inline-button path: pre-mark, drop on failure. The host can
+  // emit `approval.decided` to plugin event handlers before our REST call
+  // returns, so we need the mark in place before we hit the wire.
+  markRecentlyDecidedViaTelegram(approvalId);
+  const path =
+    action === "approve"
+      ? `/approvals/${encodeURIComponent(approvalId)}/approve`
+      : `/approvals/${encodeURIComponent(approvalId)}/reject`;
+  const who = message.from?.username || message.from?.first_name || "user";
+  const result = await callPaperclip(ctx, cfg, path, {
+    decisionNote: `Via Telegram by ${who}`,
+  });
+  if (!result.ok) {
+    recentlyDecidedViaTelegram.delete(approvalId);
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `Failed to ${action} (${result.status}): ${fmtCode(
+        truncate(JSON.stringify(result.body || {}), 200)
+      )}`
+    );
+    return;
+  }
+  const link = deepLink(cfg, "approval", approvalId);
+  const kb = link
+    ? { inline_keyboard: [[viewButton("Open in Paperclip", link)]] }
+    : undefined;
+  const head =
+    action === "approve"
+      ? `✅ Approved <b>${escapeHtml(fmtIdShort(approvalId))}</b>`
+      : `❌ Rejected <b>${escapeHtml(fmtIdShort(approvalId))}</b>`;
+  await sendReply(ctx, cfg, message, head, kb ? { reply_markup: kb } : {});
+}
+
+// ---------------------------------------------------------------------------
+// /topics — per-chat project → topic routing overrides
+// ---------------------------------------------------------------------------
+
+async function resolveProjectByArg(ctx, cfg, companyId, arg) {
+  const needle = String(arg || "").trim();
+  if (!needle || !companyId) return null;
+  const projects = asArray(
+    await pcGet(
+      ctx,
+      cfg,
+      `/companies/${encodeURIComponent(companyId)}/projects`
+    )
+  );
+  if (isUuidLike(needle)) {
+    return projects.find((p) => p.id === needle) || { id: needle, name: null };
+  }
+  const lower = needle.toLowerCase();
+  let match = projects.find(
+    (p) => p.name && p.name.toLowerCase() === lower
+  );
+  if (!match)
+    match = projects.find(
+      (p) => p.name && p.name.toLowerCase().startsWith(lower)
+    );
+  if (!match) match = projects.find((p) => p.id && p.id.startsWith(needle));
+  return match || null;
+}
+
+async function handleTopicsCommand(ctx, cfg, message, args) {
+  const parts = String(args || "").trim().split(/\s+/).filter(Boolean);
+  const sub = (parts.shift() || "").toLowerCase();
+  const chatId = message.chat?.id ?? null;
+  if (chatId == null) {
+    await sendReply(ctx, cfg, message, "Could not determine chat id.");
+    return;
+  }
+
+  if (!sub || sub === "list") {
+    const map = await getChatProjectTopics(ctx, chatId);
+    const entries = Object.entries(map);
+    if (entries.length === 0) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        "<b>Project topic mappings</b>\n<i>(none)</i>\n\nUse <code>/topics add &lt;project&gt; &lt;topicId&gt;</code> to add one."
+      );
+      return;
+    }
+    // Best-effort: resolve project names so the list is readable.
+    const companyId = await resolveCompanyId(
+      ctx,
+      cfg,
+      message.from?.id || null,
+      chatId
+    );
+    let nameById = new Map();
+    if (companyId) {
+      const projects = asArray(
+        await pcGet(
+          ctx,
+          cfg,
+          `/companies/${encodeURIComponent(companyId)}/projects`
+        )
+      );
+      for (const p of projects) if (p?.id) nameById.set(p.id, p.name || null);
+    }
+    const lines = ["<b>Project topic mappings</b>"];
+    for (const [pid, tid] of entries) {
+      const name = nameById.get(pid) || fmtIdShort(pid);
+      lines.push(`${escapeHtml(name)} → topic ${fmtCode(String(tid))}`);
+    }
+    await sendReply(ctx, cfg, message, lines.join("\n"));
+    return;
+  }
+
+  if (sub === "clear") {
+    await setChatProjectTopics(ctx, chatId, {});
+    await sendReply(ctx, cfg, message, "🧹 Cleared all project → topic mappings for this chat.");
+    return;
+  }
+
+  if (sub === "add") {
+    const projectArg = parts.shift();
+    const topicArg = parts.shift();
+    if (!projectArg || !topicArg) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        "Usage: <code>/topics add &lt;project name or uuid&gt; &lt;topicId&gt;</code>"
+      );
+      return;
+    }
+    const topicId = Number.parseInt(topicArg, 10);
+    if (!Number.isInteger(topicId) || topicId < 0) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        `topicId must be a non-negative integer (got ${fmtCode(topicArg)})`
+      );
+      return;
+    }
+    const companyId = await resolveCompanyId(
+      ctx,
+      cfg,
+      message.from?.id || null,
+      chatId
+    );
+    if (!companyId) {
+      await sendReply(ctx, cfg, message, "No company visible — cannot resolve project.");
+      return;
+    }
+    const project = await resolveProjectByArg(ctx, cfg, companyId, projectArg);
+    if (!project || !project.id) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        `Project not found: ${fmtCode(projectArg)}`
+      );
+      return;
+    }
+    const map = await getChatProjectTopics(ctx, chatId);
+    map[project.id] = topicId;
+    await setChatProjectTopics(ctx, chatId, map);
+    const name = project.name || fmtIdShort(project.id);
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `📌 <b>${escapeHtml(name)}</b> → topic ${fmtCode(String(topicId))}`
+    );
+    return;
+  }
+
+  if (sub === "remove" || sub === "rm" || sub === "delete") {
+    const projectArg = parts.shift();
+    if (!projectArg) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        "Usage: <code>/topics remove &lt;project name or uuid&gt;</code>"
+      );
+      return;
+    }
+    const companyId = await resolveCompanyId(
+      ctx,
+      cfg,
+      message.from?.id || null,
+      chatId
+    );
+    const project = companyId
+      ? await resolveProjectByArg(ctx, cfg, companyId, projectArg)
+      : (isUuidLike(projectArg) ? { id: projectArg, name: null } : null);
+    if (!project || !project.id) {
+      await sendReply(
+        ctx,
+        cfg,
+        message,
+        `Project not found: ${fmtCode(projectArg)}`
+      );
+      return;
+    }
+    const map = await getChatProjectTopics(ctx, chatId);
+    if (!(project.id in map)) {
+      await sendReply(ctx, cfg, message, "No mapping to remove for that project.");
+      return;
+    }
+    delete map[project.id];
+    await setChatProjectTopics(ctx, chatId, map);
+    const name = project.name || fmtIdShort(project.id);
+    await sendReply(
+      ctx,
+      cfg,
+      message,
+      `🗑 Removed topic mapping for <b>${escapeHtml(name)}</b>`
+    );
+    return;
+  }
+
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    "Usage: <code>/topics [list|add|remove|clear]</code>\n" +
+      "• <code>/topics list</code>\n" +
+      "• <code>/topics add &lt;project&gt; &lt;topicId&gt;</code>\n" +
+      "• <code>/topics remove &lt;project&gt;</code>\n" +
+      "• <code>/topics clear</code>"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /digest — on-demand summary for active workspace
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the digest text+keyboard for one company. Used by both /digest and
+ * the scheduled job. Returns { text, reply_markup? }.
+ */
+async function buildCompanyDigest(ctx, cfg, company) {
+  if (!company || !company.id) return null;
+  const cid = company.id;
+  const name = company.name || fmtIdShort(cid);
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const issues = asArray(
+    await pcGet(
+      ctx,
+      cfg,
+      `/companies/${encodeURIComponent(cid)}/issues?limit=200`
+    )
+  );
+  const agents = asArray(
+    await pcGet(ctx, cfg, `/companies/${encodeURIComponent(cid)}/agents`)
+  );
+  const approvals = (await fetchPendingApprovals(ctx, cfg, cid)) || [];
+
+  const tsOf = (v) => {
+    const t = typeof v === "string" ? Date.parse(v) : NaN;
+    return Number.isFinite(t) ? t : 0;
+  };
+  const closedRecent = issues.filter(
+    (i) => i?.status === "done" && tsOf(i.updatedAt) >= since
+  );
+  const newRecent = issues.filter((i) => tsOf(i?.createdAt) >= since);
+  const busyAgents = agents.filter(
+    (a) =>
+      a?.status && a.status !== "idle" && a.status !== "terminated"
+  );
+
+  const lines = [
+    `📰 <b>Daily digest</b> · 🏢 ${escapeHtml(name)}`,
+    "",
+    `✅ Closed (24h): ${fmtCode(String(closedRecent.length))}`,
+    `🆕 New issues (24h): ${fmtCode(String(newRecent.length))}`,
+    `🟡 Pending approvals: ${fmtCode(String(approvals.length))}`,
+    `🤖 Agents not idle: ${fmtCode(String(busyAgents.length))} / ${fmtCode(String(agents.length))}`,
+  ];
+
+  // A few example titles, capped, for at-a-glance scanning.
+  if (closedRecent.length > 0) {
+    lines.push("", "<b>Recently closed</b>");
+    for (const i of closedRecent.slice(0, 5)) {
+      const ident = i.identifier || fmtIdShort(i.id || "");
+      lines.push(
+        `• <b>${escapeHtml(ident)}</b> ${escapeHtml(truncate(i.title || "(untitled)", 80))}`
+      );
+    }
+  }
+  if (newRecent.length > 0) {
+    lines.push("", "<b>New</b>");
+    for (const i of newRecent.slice(0, 5)) {
+      const ident = i.identifier || fmtIdShort(i.id || "");
+      lines.push(
+        `• <b>${escapeHtml(ident)}</b> ${escapeHtml(truncate(i.title || "(untitled)", 80))}`
+      );
+    }
+  }
+  if (busyAgents.length > 0) {
+    lines.push("", "<b>Active agents</b>");
+    for (const a of busyAgents.slice(0, 5)) {
+      const an = a.displayName || a.name || fmtIdShort(a.id || "");
+      lines.push(`• ${statusEmoji(a.status)} ${escapeHtml(an)} (${fmtCode(a.status || "?")})`);
+    }
+  }
+
+  const link = deepLink(cfg, "project", null) || cfg.paperclipPublicUrl;
+  const kb = link
+    ? { inline_keyboard: [[viewButton("Open in Paperclip", String(link).replace(/\/+$/, ""))]] }
+    : undefined;
+  return { text: lines.join("\n"), reply_markup: kb };
+}
+
+async function handleDigestCommand(ctx, cfg, message) {
+  const companyId = await resolveCompanyId(
+    ctx,
+    cfg,
+    message.from?.id || null,
+    message.chat?.id ?? null
+  );
+  if (!companyId) {
+    await sendReply(ctx, cfg, message, "No company visible to this plugin.");
+    return;
+  }
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  const company = companies.find((c) => c.id === companyId) || { id: companyId };
+  const view = await buildCompanyDigest(ctx, cfg, company);
+  if (!view) {
+    await sendReply(ctx, cfg, message, "Could not build digest.");
+    return;
+  }
+  await sendReply(
+    ctx,
+    cfg,
+    message,
+    view.text,
+    view.reply_markup ? { reply_markup: view.reply_markup } : {}
+  );
+}
+
+// Iterates every visible company, builds a digest, and posts it to the
+// digest chat (digestChatId, falling back to defaultChatId). Used by both
+// the scheduled job handler and any future ops/debug path.
+async function runDailyDigestForAllCompanies(ctx, cfg) {
+  const chatId =
+    (typeof cfg.digestChatId === "string" && cfg.digestChatId.trim()) ||
+    (typeof cfg.defaultChatId === "string" && cfg.defaultChatId.trim()) ||
+    "";
+  if (!chatId) {
+    ctx.logger.warn("daily digest: no chat id configured — skipping");
+    return;
+  }
+  const token = (cfg.botToken || "").trim();
+  if (!token) {
+    ctx.logger.warn("daily digest: no botToken — skipping");
+    return;
+  }
+  const topicId = Number.isInteger(cfg.digestTopicId)
+    ? cfg.digestTopicId
+    : Number.isInteger(cfg.defaultTopicId)
+    ? cfg.defaultTopicId
+    : null;
+  const tg = createTelegram(ctx, token);
+  const companies = asArray(await pcGet(ctx, cfg, "/companies"));
+  if (companies.length === 0) {
+    ctx.logger.info("daily digest: no companies visible — skipping");
+    return;
+  }
+  for (const c of companies) {
+    try {
+      const view = await buildCompanyDigest(ctx, cfg, c);
+      if (!view) continue;
+      const body = {
+        chat_id: chatId,
+        text: clampMessage(view.text),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      };
+      if (topicId != null) body.message_thread_id = topicId;
+      if (view.reply_markup) body.reply_markup = view.reply_markup;
+      await tg.sendMessage(body);
+    } catch (err) {
+      ctx.logger.warn("daily digest: per-company send failed", {
+        err: String(err),
+        companyId: c?.id,
+      });
+    }
   }
 }
 
@@ -1598,6 +2192,21 @@ async function handleCommand(ctx, cfg, message) {
       return true;
     case "use":
       await handleUseCommand(ctx, cfg, message, args);
+      return true;
+    case "connect":
+      await handleConnectCommand(ctx, cfg, message, args);
+      return true;
+    case "approve":
+      await handleApprovalDecisionCommand(ctx, cfg, message, args, "approve");
+      return true;
+    case "reject":
+      await handleApprovalDecisionCommand(ctx, cfg, message, args, "reject");
+      return true;
+    case "topics":
+      await handleTopicsCommand(ctx, cfg, message, args);
+      return true;
+    case "digest":
+      await handleDigestCommand(ctx, cfg, message);
       return true;
     default:
       return false;
@@ -1681,7 +2290,8 @@ async function callPaperclip(ctx, cfg, pathRel, body) {
 async function refreshIssuesListMessage(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const userId = query.from?.id || null;
-  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  const chatId = query.message?.chat?.id ?? null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId, chatId);
   if (!companyId) return;
   const issues = asArray(
     await pcGet(
@@ -1719,7 +2329,8 @@ async function refreshIssueDetailMessage(ctx, cfg, query, issueId) {
 async function refreshApprovalsListMessage(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const userId = query.from?.id || null;
-  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  const chatId = query.message?.chat?.id ?? null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId, chatId);
   if (!companyId) return;
   const pending = await fetchPendingApprovals(ctx, cfg, companyId);
   const view = renderApprovalsListView(cfg, pending || []);
@@ -1736,7 +2347,8 @@ async function refreshApprovalsListMessage(ctx, cfg, query) {
 async function refreshAgentsListMessage(ctx, cfg, query) {
   const tg = createTelegram(ctx, (cfg.botToken || "").trim());
   const userId = query.from?.id || null;
-  const companyId = await resolveCompanyId(ctx, cfg, userId);
+  const chatId = query.message?.chat?.id ?? null;
+  const companyId = await resolveCompanyId(ctx, cfg, userId, chatId);
   if (!companyId) return;
   const agents = asArray(
     await pcGet(ctx, cfg, `/companies/${encodeURIComponent(companyId)}/agents`)
@@ -2091,6 +2703,13 @@ const plugin = definePlugin({
       return cfg;
     }
 
+    // Helper — pull a projectId off an event payload if present. Used to
+    // tag entityRefs so dispatchMessage can apply per-chat /topics overrides.
+    const pidOf = (event) => {
+      const p = event?.payload;
+      return p && typeof p.projectId === "string" ? p.projectId : null;
+    };
+
     // Issues
     ctx.events.on(
       "issue.created",
@@ -2103,7 +2722,7 @@ const plugin = definePlugin({
           "issue.created",
           html,
           kb ? { reply_markup: kb } : {},
-          { type: "issue", id: event.entityId, companyId: event.companyId }
+          { type: "issue", id: event.entityId, companyId: event.companyId, projectId: pidOf(event) }
         );
       })
     );
@@ -2132,7 +2751,7 @@ const plugin = definePlugin({
           "issue.updated",
           html,
           kb ? { reply_markup: kb } : {},
-          { type: "issue", id: event.entityId, companyId: event.companyId }
+          { type: "issue", id: event.entityId, companyId: event.companyId, projectId: pidOf(event) }
         );
       })
     );
@@ -2155,7 +2774,7 @@ const plugin = definePlugin({
           html,
           kb ? { reply_markup: kb } : {},
           issueId
-            ? { type: "issue", id: issueId, companyId: event.companyId }
+            ? { type: "issue", id: issueId, companyId: event.companyId, projectId: pidOf(event) }
             : null
         );
       })
@@ -2173,7 +2792,7 @@ const plugin = definePlugin({
           "approval.created",
           html,
           kb ? { reply_markup: kb } : {},
-          { type: "approval", id: event.entityId, companyId: event.companyId }
+          { type: "approval", id: event.entityId, companyId: event.companyId, projectId: pidOf(event) }
         );
       })
     );
@@ -2202,7 +2821,7 @@ const plugin = definePlugin({
           "approval.decided",
           html,
           kb ? { reply_markup: kb } : {},
-          { type: "approval", id: event.entityId, companyId: event.companyId }
+          { type: "approval", id: event.entityId, companyId: event.companyId, projectId: pidOf(event) }
         );
       })
     );
@@ -2214,7 +2833,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunStarted", false);
         if (!cfg) return;
         const html = fmtAgentRun("▶️ <b>Agent run started</b>", event, cfg);
-        await send("agent.run.started", html, {}, { type: "event", companyId: event.companyId });
+        await send("agent.run.started", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2224,7 +2843,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunFinished", false);
         if (!cfg) return;
         const html = fmtAgentRun("🏁 <b>Agent run finished</b>", event, cfg);
-        await send("agent.run.finished", html, {}, { type: "event", companyId: event.companyId });
+        await send("agent.run.finished", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2234,7 +2853,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunCancelled", false);
         if (!cfg) return;
         const html = fmtAgentRun("🚫 <b>Agent run cancelled</b>", event, cfg);
-        await send("agent.run.cancelled", html, {}, { type: "event", companyId: event.companyId });
+        await send("agent.run.cancelled", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2244,7 +2863,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "agentRunFailed", true);
         if (!cfg) return;
         const html = fmtAgentRun("❌ <b>Agent run failed</b>", event, cfg);
-        await send("agent.run.failed", html, {}, { type: "event", companyId: event.companyId });
+        await send("agent.run.failed", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2255,7 +2874,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "budgetIncidentOpened", true);
         if (!cfg) return;
         const html = fmtBudget("💸 <b>Budget incident</b>", event, cfg);
-        await send("budget.incident.opened", html, {}, { type: "event", companyId: event.companyId });
+        await send("budget.incident.opened", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2265,7 +2884,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "budgetIncidentResolved", false);
         if (!cfg) return;
         const html = fmtBudget("✅ <b>Budget incident resolved</b>", event, cfg);
-        await send("budget.incident.resolved", html, {}, { type: "event", companyId: event.companyId });
+        await send("budget.incident.resolved", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2276,7 +2895,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "goalCreated", false);
         if (!cfg) return;
         const html = fmtGoal("🎯 <b>Goal created</b>", event, cfg);
-        await send("goal.created", html, {}, { type: "event", companyId: event.companyId });
+        await send("goal.created", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2286,7 +2905,7 @@ const plugin = definePlugin({
         const cfg = await gate(event, "goalUpdated", false);
         if (!cfg) return;
         const html = fmtGoal("🎯 <b>Goal updated</b>", event, cfg);
-        await send("goal.updated", html, {}, { type: "event", companyId: event.companyId });
+        await send("goal.updated", html, {}, { type: "event", companyId: event.companyId, projectId: pidOf(event) });
       })
     );
 
@@ -2298,6 +2917,26 @@ const plugin = definePlugin({
       await ensureCommandsRegistered(ctx, cfg);
     } catch (err) {
       ctx.logger.warn("bot wiring on startup failed", { err: String(err) });
+    }
+
+    // Scheduled jobs — must match a jobKey declared in the manifest. Host
+    // calls this handler on the declared cron schedule.
+    try {
+      ctx.jobs.register("telegram-daily-digest", async (job) => {
+        ctx.logger.info("daily digest job triggered", {
+          runId: job?.runId,
+          trigger: job?.trigger,
+          scheduledAt: job?.scheduledAt,
+        });
+        try {
+          const cfg = await ctx.config.get();
+          await runDailyDigestForAllCompanies(ctx, cfg);
+        } catch (err) {
+          ctx.logger.error("daily digest job failed", { err: String(err) });
+        }
+      });
+    } catch (err) {
+      ctx.logger.warn("ctx.jobs.register failed", { err: String(err) });
     }
 
     ctx.logger.info("paperclipai-plugin-telegram setup complete");

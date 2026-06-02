@@ -46,7 +46,7 @@ const eventToggle = (defaultOn, title) => ({
 export default {
   id: "paperclipai.telegram",
   apiVersion: 1,
-  version: "0.8.0",
+  version: "0.9.0",
   displayName: "Telegram",
   description:
     "Telegram bot integration for Paperclip: push notifications for issues, approvals, agent runs, comments, budgets, goals; deep links into the Paperclip UI; optional inline approve/reject buttons; bot commands over a webhook.",
@@ -67,8 +67,21 @@ export default {
     "agents.read",
     "agents.pause",
     "agents.resume",
+    "jobs.schedule",
   ],
   entrypoints: { worker: "./dist/worker.js" },
+  jobs: [
+    {
+      jobKey: "telegram-daily-digest",
+      displayName: "Daily Telegram digest",
+      description:
+        "Posts a once-a-day per-workspace summary to digestChatId (or defaultChatId): issues closed in the last 24h, new issues, open approvals, and agents not idle.",
+      // Flat 5-field cron string — see pluginJobDeclarationSchema in
+      // @paperclipai/shared/dist/validators/plugin.js. The host's validator
+      // rejects nested { type, expression } shapes.
+      schedule: "0 9 * * *",
+    },
+  ],
   webhooks: [
     {
       endpointKey: "telegram",
@@ -113,6 +126,18 @@ export default {
         title: "Default forum topic ID",
         description:
           "Optional forum topic for the default chat. Per-route topics override this.",
+      },
+      digestChatId: {
+        type: "string",
+        title: "Daily digest chat ID (optional)",
+        description:
+          "Where the scheduled daily digest goes. Falls back to defaultChatId when blank.",
+      },
+      digestTopicId: {
+        type: "integer",
+        title: "Daily digest forum topic ID (optional)",
+        description:
+          "Optional forum topic for the daily digest. Falls back to defaultTopicId when blank.",
       },
       paperclipPublicUrl: {
         type: "string",
